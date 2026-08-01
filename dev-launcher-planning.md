@@ -1,0 +1,162 @@
+# Planning: Dev Launcher (One-Click Project Starter)
+
+## Overview
+Aplikasi desktop untuk menjalankan seluruh proses yang dibutuhkan sebuah project (start Laragon, `npm run dev`, buka VS Code, buka browser, dll) sekaligus lewat satu tombol. Dilengkapi live log viewer per project, status indicator, dan deteksi bentrok port sebelum start.
+
+## Tech Stack
+- **Backend/Shell**: Tauri v2 (Rust) — process spawning, kill, event streaming
+- **Frontend**: Next.js (App Router, TypeScript, Tailwind CSS), static export
+- **Process management**: `std::process::Command` / `tokio::process` (Rust)
+- **Port detection**: reuse logic dari project [[port-monitor-tool]] — command `get_active_ports()` yang sama
+- **Storage**: profile project disimpan sebagai JSON lokal (`~/.dev-launcher/profiles.json`), tidak perlu database
+
+## Setup / Install Commands
+
+Prasyarat (kalau belum ada dari setup port-monitor sebelumnya, skip yang sudah terpasang):
+```bash
+# 1. Cek Rust
+rustc --version
+cargo --version
+
+# 2. Cek Tauri CLI
+cargo tauri --version
+# kalau belum ada:
+cargo install tauri-cli
+```
+
+Bikin project baru:
+```bash
+# 1. Buat folder & masuk
+cd D:\projek
+mkdir dev-launcher
+cd dev-launcher
+
+# 2. Init Next.js
+npx create-next-app@latest .
+# pilihan: TypeScript Yes, ESLint Yes, React Compiler No,
+# Tailwind Yes, src/ dir Yes, App Router Yes, import alias default @/*
+
+# 3. Init Tauri di folder yang sama
+cargo tauri init
+# App name: dev-launcher
+# Window title: dev launcher
+# Web assets: ../out
+# Dev server URL: http://localhost:3000
+# Dev command: npm run dev
+# Build command: npm run build
+```
+
+Tambahan dependency (setelah project ke-generate):
+```bash
+cd src-tauri
+```
+Tambahkan di `Cargo.toml`:
+```toml
+[dependencies]
+sysinfo = "0.32"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+```
+
+Frontend (dari root project):
+```bash
+npm install @tauri-apps/api
+```
+
+Setting `next.config.ts` untuk static export:
+```typescript
+const nextConfig: NextConfig = {
+  output: "export",
+  images: { unoptimized: true },
+};
+```
+
+## Data Model
+
+Profile project (`~/.dev-launcher/profiles.json`):
+```json
+{
+  "profiles": [
+    {
+      "id": "uuid",
+      "name": "Jubelio Clone",
+      "steps": [
+        { "type": "exe", "path": "C:\\laragon\\laragon.exe" },
+        { "type": "command", "cwd": "D:\\laragon\\www\\jubelio-clone", "cmd": "npm run dev", "port": 3000 },
+        { "type": "open_url", "url": "http://localhost:3000" }
+      ]
+    }
+  ]
+}
+```
+
+## Fitur Inti
+
+### 1. Manajemen profile
+- Tambah/edit/hapus profile project
+- Tiap profile berisi list step (jalankan exe, jalankan command dengan cwd tertentu, buka URL)
+- Step bertipe `command` bisa ditandai port yang dipakai, buat keperluan cek bentrok
+
+### 2. Start / Stop
+- Tombol "Start" jalanin semua step berurutan, simpan PID tiap child process yang di-spawn
+- Tombol "Stop" kill semua PID terkait profile itu
+- Status per profile: `stopped` / `running` / `failed` (ditampilkan via status dot)
+
+### 3. Deteksi bentrok port (fitur utama)
+- Sebelum menjalankan step bertipe `command` yang punya `port`, panggil `get_active_ports()`
+- Kalau port sudah dipakai, tampilkan banner/modal peringatan dengan 3 pilihan:
+  - **Kill & Continue** — kill proses yang pegang port, lanjut start
+  - **Ganti port** — kalau command support env var port, jalankan dengan port alternatif
+  - **Batal** — hentikan proses start untuk profile itu
+
+### 4. Live log viewer
+- Tiap child process, stdout/stderr di-stream ke frontend lewat Tauri event (`emit`/`listen`)
+- Panel log per profile, bisa switch tampilan antar profile yang sedang aktif
+
+### 5. Status indicator
+- Dot hijau (running), abu (stopped), merah (failed/error)
+- Checklist step yang sudah selesai vs yang masih jalan
+
+## Struktur Tauri Commands (Rust)
+
+```rust
+#[tauri::command]
+async fn start_profile(profile_id: String) -> Result<(), String>
+
+#[tauri::command]
+async fn stop_profile(profile_id: String) -> Result<(), String>
+
+#[tauri::command]
+fn get_active_ports() -> Vec<PortInfo> // reuse dari port-monitor
+
+#[tauri::command]
+fn kill_process(pid: u32) -> Result<(), String>
+
+#[tauri::command]
+fn list_profiles() -> Vec<Profile>
+
+#[tauri::command]
+fn save_profile(profile: Profile) -> Result<(), String>
+
+#[tauri::command]
+fn delete_profile(profile_id: String) -> Result<(), String>
+```
+
+## Urutan Pengerjaan (Disarankan)
+1. Setup project (sudah ada command di atas)
+2. Backend: struct `Profile`/`Step`, command `list_profiles`/`save_profile`/`delete_profile` (read/write JSON lokal)
+3. Frontend: UI form untuk bikin/edit profile
+4. Backend: command `start_profile` — spawn process berurutan sesuai step, simpan PID
+5. Backend: streaming stdout/stderr via Tauri event
+6. Frontend: card list profile + log panel (kayak mockup yang sudah didesain)
+7. Integrasi deteksi port bentrok (reuse `get_active_ports` dari project port-monitor)
+8. Fitur stop/kill process
+9. Testing: `cargo tauri dev`
+10. Build: `cargo tauri build`
+
+## Catatan
+- Kalau project [[port-monitor-tool]] sudah selesai duluan, logic Rust buat baca port (`netstat -ano` parsing) tinggal di-copy langsung ke project ini — nggak perlu bikin ulang dari nol.
+- Auto-kill proses sebaiknya selalu minta konfirmasi user dulu, jangan otomatis diam-diam (bisa berbahaya kalau proses itu bukan dev server sembarangan).
+- Step bertipe `command` yang portnya hardcoded di kode (bukan lewat env var) tidak bisa auto-ganti port — user harus edit source project itu sendiri.
