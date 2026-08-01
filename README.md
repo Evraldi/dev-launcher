@@ -1,36 +1,98 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Dev Launcher
 
-## Getting Started
+Desktop app untuk menjalankan semua proses development project dengan satu tombol — start Laragon, `npm run dev`, buka VS Code/browser, semuanya otomatis.
 
-First, run the development server:
+## Features
+
+- **Multi-step profiles** — Jalankan exe, command, atau buka URL secara berurutan
+- **Live log viewer** — Lihat stdout/stderr realtime dengan tab per step
+- **Port conflict detection** — Deteksi port yang bentrok sebelum start, bisa auto-kill
+- **Process management** — Start/stop profile, kill tree seluruh child process
+- **Log persistence** — Log tetap ada saat pindah antar profile
+
+## Tech Stack
+
+- **Tauri v2** — Desktop app framework (Rust + WebView)
+- **Next.js 16** — Frontend (App Router, TypeScript, Tailwind v4)
+- **Rust** — Backend logic (process spawning, port detection, log streaming)
+- **TypeScript** — Type-safe frontend
+
+## Development
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+# Install dependencies
+npm install
+
+# Run dev mode (hot reload frontend + Rust backend)
+cargo tauri dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Frontend: `http://localhost:1420` (atau port lain yang tersedia)
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Build
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+# Build production binary
+cargo tauri build
+```
 
-## Learn More
+Output: `src-tauri/target/release/dev-launcher.exe`
 
-To learn more about Next.js, take a look at the following resources:
+## Project Structure
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```
+dev-launcher/
+├── src/                      # Next.js frontend
+│   ├── app/                  # App Router pages
+│   ├── components/           # React components
+│   ├── lib/                  # Utilities (tauri wrapper)
+│   └── types.ts              # TypeScript types
+├── src-tauri/                # Rust backend
+│   ├── src/
+│   │   ├── lib.rs            # Tauri commands registration
+│   │   ├── models.rs         # Profile/Step structs
+│   │   ├── storage.rs        # JSON persistence (~/.dev-launcher/)
+│   │   ├── ports.rs          # Port detection (netstat parsing)
+│   │   └── runner.rs         # Process spawning & log streaming
+│   └── Cargo.toml
+└── package.json
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## How It Works
 
-## Deploy on Vercel
+1. **Profile** berisi list of **steps** (exe/command/open_url)
+2. Klik **Start** → backend spawn proses berurutan
+3. Log di-stream via Tauri event (`profile-log`) realtime
+4. **Stop** → kill tree seluruh child process (Windows: `taskkill /T /F`)
+5. Port conflict check sebelum start → modal "Kill & Continue" atau batal
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Storage
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Profiles disimpan di: `~/.dev-launcher/profiles.json`
+
+Format:
+```json
+{
+  "profiles": [
+    {
+      "id": "uuid",
+      "name": "Project X",
+      "steps": [
+        { "type": "exe", "path": "C:\\laragon\\laragon.exe" },
+        { "type": "command", "cwd": "C:\\project", "cmd": "npm run dev", "port": 3000 },
+        { "type": "open_url", "url": "http://localhost:3000" }
+      ]
+    }
+  ]
+}
+```
+
+## Notes
+
+- **Windows**: `npm`/`npx` shim dijalankan via `cmd.exe /C` (Windows CreateProcess limitation)
+- **Kill tree**: Gunakan `taskkill /T` untuk kill parent + semua child process
+- **Auto port switch**: Tools seperti Next.js/Vite handle auto-increment port sendiri (3000 → 3001 → ...)
+
+## License
+
+MIT
