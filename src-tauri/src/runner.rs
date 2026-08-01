@@ -160,6 +160,13 @@ async fn spawn_command_step(
         command.env("APP_PORT", port.to_string());
     }
 
+    // Hindari munculnya console window di Windows
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(util::CREATE_NO_WINDOW);
+    }
+
     let mut child = command
         .spawn()
         .map_err(|e| format!("Step {step_index}: gagal spawn `{program}`: {e}"))?;
@@ -274,7 +281,16 @@ pub async fn start_profile(
                     );
                     return Err(format!("Step {idx}: file tidak ditemukan: {path}"));
                 }
-                match std::process::Command::new(path).spawn() {
+
+                // Build command dengan CREATE_NO_WINDOW flag untuk hindari console window
+                let mut cmd = std::process::Command::new(path);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    cmd.creation_flags(util::CREATE_NO_WINDOW);
+                }
+
+                match cmd.spawn() {
                     Ok(child) => {
                         let pid = child.id();
                         pids.push(StepPid {
