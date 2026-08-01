@@ -264,7 +264,11 @@ export default function Home() {
           </aside>
 
           {/* Konten kanan */}
-          <section className="flex flex-1 flex-col overflow-hidden p-4">
+          <section
+            className={`min-h-0 flex-1 flex-col p-4 ${
+              editing ? "flex overflow-y-auto" : "flex overflow-hidden"
+            }`}
+          >
             {editing ? (
               <ProfileForm
                 initial={editing === "new" ? null : editing}

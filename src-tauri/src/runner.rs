@@ -99,6 +99,34 @@ fn emit_log_plain(app: &AppHandle, profile_id: &str, step_index: usize, source: 
     );
 }
 
+/// Bangun `TokioCommand` untuk menjalankan sebuah command step.
+/// Di Windows, `npm`/`npx`/`yarn`/`pnpm` adalah shim `.cmd`/`.bat` yang tidak
+/// bisa di-spawn langsung oleh `CreateProcess` (error "program not found").
+/// Semua program non-`.exe` dijalankan lewat `cmd.exe /C` agar shim tersebut
+/// berfungsi; program `.exe` di-spawn langsung.
+fn build_command(program: &str, args: &[String], full_cmd: &str) -> TokioCommand {
+    #[cfg(windows)]
+    {
+        let is_direct_exe = program.to_lowercase().ends_with(".exe");
+        if is_direct_exe {
+            let mut c = TokioCommand::new(program);
+            c.args(args);
+            c
+        } else {
+            let mut c = TokioCommand::new("cmd");
+            c.arg("/D").arg("/S").arg("/C").arg(full_cmd);
+            c
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = full_cmd;
+        let mut c = TokioCommand::new(program);
+        c.args(args);
+        c
+    }
+}
+
 async fn spawn_command_step(
     app: AppHandle,
     profile_id: &str,
@@ -120,8 +148,7 @@ async fn spawn_command_step(
         ));
     }
 
-    let mut command = TokioCommand::new(program);
-    command.args(&args);
+    let mut command = build_command(program, &args, cmd);
     command.current_dir(cwd);
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
@@ -343,21 +370,9 @@ pub fn stop_profile(
             .unwrap_or_else(|p| p.into_inner());
         let pids = map.remove(&profile_id).unwrap_or_default();
         let mut killed = Vec::new();
-        if !pids.is_empty() {
-            // Satu kali refresh sysinfo untuk semua PID.
-            let mut sys = sysinfo::System::new_all();
-            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-            for pid in pids {
-                match sys.process(sysinfo::Pid::from_u32(pid)) {
-                    Some(proc) => {
-                        let _ = proc.kill();
-                    }
-                    None => {
-                        let _ = crate::ports::kill_process(pid);
-                    }
-                }
-                killed.push(pid);
-            }
+        for pid in pids {
+            kill_tree(pid);
+            killed.push(pid);
         }
         killed
     };
@@ -373,6 +388,28 @@ pub fn stop_profile(
     );
 
     Ok(())
+}
+
+/// Kill sebuah proses beserta seluruh anaknya (pohon proses).
+/// Di Windows pakai `taskkill /T /F` karena process yang di-spawn bisa berupa
+/// `cmd.exe` yang membungkus `npm.cmd` yang membungkus `node` — membunuh
+/// hanya satu PID saja tidak cukup.
+#[cfg(windows)]
+fn kill_tree(pid: u32) {
+    use std::os::windows::process::CommandExt;
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .creation_flags(util::CREATE_NO_WINDOW)
+        .output();
+}
+
+#[cfg(not(windows))]
+fn kill_tree(pid: u32) {
+    let mut sys = sysinfo::System::new_all();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    if let Some(proc) = sys.process(sysinfo::Pid::from_u32(pid)) {
+        let _ = proc.kill();
+    }
 }
 
 /// Helper agar tidak memunculkan jendela console pada Windows.
