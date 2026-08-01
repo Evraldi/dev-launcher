@@ -1,16 +1,24 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import type { PortConflict, Profile, ProfileStatus, StatusPayload } from "@/types";
+import { useEffect, useState, useSyncExternalStore } from "react";
+import type {
+  PortConflict,
+  Profile,
+  ProfileStatus,
+  StatusPayload,
+} from "@/types";
 import ProfileForm from "@/components/ProfileForm";
 import LogPanel from "@/components/LogPanel";
 import StatusDot from "@/components/StatusDot";
 import ConflictModal from "@/components/ConflictModal";
 import { api, isTauri, onProfileStatus } from "@/lib/tauri";
 
+function subscribeNoop(): () => void {
+  return () => {};
+}
+
 export default function Home() {
   const [profiles, setProfiles] = useState<Profile[]>([]);
-  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<Profile | null | "new">(null);
   const [statuses, setStatuses] = useState<Record<string, ProfileStatus>>({});
@@ -18,6 +26,19 @@ export default function Home() {
   const [conflicts, setConflicts] = useState<PortConflict[] | null>(null);
   const [pendingStartId, setPendingStartId] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
+  // Deteksi Tauri via useSyncExternalStore: server (static export) dan render
+  // pertama di client sama-sama menghasilkan `false`, lalu berubah setelah
+  // hydration tanpa setState sinkron di dalam effect → tidak terjadi
+  // hydration mismatch.
+  const isTauriEnv = useSyncExternalStore(
+    subscribeNoop,
+    () => (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window),
+    () => false
+  );
+  // Dimuat hanya saat berada di dalam Tauri; di preview web langsung `true`
+  // sehingga list profile kosong ditampilkan (tanpa error API).
+  const [loaded, setLoaded] = useState(false);
+  const loading = isTauriEnv && !loaded;
 
   async function refreshProfiles() {
     const list = await api.listProfiles();
@@ -25,18 +46,19 @@ export default function Home() {
   }
 
   useEffect(() => {
+    if (!isTauri()) return; // Preview web: tidak ada profile yang dimuat.
     let cancelled = false;
     (async () => {
       try {
         const list = await api.listProfiles();
         if (!cancelled) {
           setProfiles(list);
-          setLoading(false);
+          setLoaded(true);
         }
       } catch (err) {
         if (!cancelled) {
           setError(err instanceof Error ? err.message : String(err));
-          setLoading(false);
+          setLoaded(true);
         }
       }
     })();
@@ -156,7 +178,7 @@ export default function Home() {
         </button>
       </header>
 
-      {!isTauri() && (
+      {!isTauriEnv && (
         <div className="mx-6 mt-4 rounded-md bg-amber-50 px-4 py-3 text-sm text-amber-800">
           <strong>Mode pratinjau web.</strong> Jalankan lewat{" "}
           <code>cargo tauri dev</code> untuk fungsionalitas penuh (start/stop

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { LogPayload } from "@/types";
+import { onProfileLog } from "@/lib/tauri";
 
 interface LogEntry {
   id: number;
@@ -16,27 +17,29 @@ export default function LogPanel({ profileId }: { profileId: string }) {
 
   useEffect(() => {
     let unlisten: (() => void) | null = null;
+    let mounted = true;
 
-    (async () => {
-      const { onProfileLog } = await import("@/lib/tauri");
-      unlisten = await onProfileLog((payload: LogPayload) => {
-        if (payload.profileId !== profileId) return;
-        setEntries((prev) => {
-          const next = [...prev];
-          // Batasi jumlah baris supaya panel tetap ringan.
-          if (next.length > 2000) next.splice(0, next.length - 2000);
-          next.push({
-            id: ++logId,
-            stepIndex: payload.stepIndex,
-            source: payload.source,
-            message: payload.message,
-          });
-          return next;
+    onProfileLog((payload: LogPayload) => {
+      if (!mounted || payload.profileId !== profileId) return;
+      setEntries((prev) => {
+        const next = [...prev];
+        // Batasi jumlah baris supaya panel tetap ringan.
+        if (next.length > 2000) next.splice(0, next.length - 2000);
+        next.push({
+          id: ++logId,
+          stepIndex: payload.stepIndex,
+          source: payload.source,
+          message: payload.message,
         });
+        return next;
       });
-    })();
+    }).then((un) => {
+      if (mounted) unlisten = un;
+      else un(); // Jika sudah unmount sebelum listener terpasang, langsung cleanup.
+    });
 
     return () => {
+      mounted = false;
       unlisten?.();
     };
   }, [profileId]);
