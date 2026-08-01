@@ -51,3 +51,10 @@ export interface StatusPayload {
 }
 
 export type ProfileStatus = "stopped" | "running" | "starting" | "failed";
+
+export interface LogEntry {
+  id: number;
+  stepIndex: number;
+  source: string;
+  message: string;
+}

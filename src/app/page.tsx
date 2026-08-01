@@ -2,6 +2,8 @@
 
 import { useEffect, useState, useSyncExternalStore } from "react";
 import type {
+  LogEntry,
+  LogPayload,
   PortConflict,
   Profile,
   ProfileStatus,
@@ -11,11 +13,13 @@ import ProfileForm from "@/components/ProfileForm";
 import LogPanel from "@/components/LogPanel";
 import StatusDot from "@/components/StatusDot";
 import ConflictModal from "@/components/ConflictModal";
-import { api, isTauri, onProfileStatus } from "@/lib/tauri";
+import { api, isTauri, onProfileStatus, onProfileLog } from "@/lib/tauri";
 
 function subscribeNoop(): () => void {
   return () => {};
 }
+
+let logId = 0;
 
 export default function Home() {
   const [profiles, setProfiles] = useState<Profile[]>([]);
@@ -26,6 +30,9 @@ export default function Home() {
   const [conflicts, setConflicts] = useState<PortConflict[] | null>(null);
   const [pendingStartId, setPendingStartId] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
+  const [profileLogs, setProfileLogs] = useState<Record<string, LogEntry[]>>(
+    {}
+  );
   // Deteksi Tauri via useSyncExternalStore: server (static export) dan render
   // pertama di client sama-sama menghasilkan `false`, lalu berubah setelah
   // hydration tanpa setState sinkron di dalam effect → tidak terjadi
@@ -64,6 +71,29 @@ export default function Home() {
     })();
     return () => {
       cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: (() => void) | null = null;
+    onProfileLog((payload: LogPayload) => {
+      setProfileLogs((prev) => {
+        const current = prev[payload.profileId] || [];
+        const next = [...current];
+        // Batasi jumlah baris per profile supaya tetap ringan.
+        if (next.length > 2000) next.splice(0, next.length - 2000);
+        next.push({
+          id: ++logId,
+          stepIndex: payload.stepIndex,
+          source: payload.source,
+          message: payload.message,
+        });
+        return { ...prev, [payload.profileId]: next };
+      });
+    }).then((un) => (unlisten = un));
+    return () => {
+      unlisten?.();
     };
   }, []);
 
@@ -307,7 +337,7 @@ export default function Home() {
                   <StatusDot status={statuses[activeProfileId] ?? "stopped"} />
                 </div>
                 <div className="min-h-0 flex-1">
-                  <LogPanel key={activeProfileId} profileId={activeProfileId} />
+                  <LogPanel entries={profileLogs[activeProfileId] || []} />
                 </div>
               </>
             ) : (

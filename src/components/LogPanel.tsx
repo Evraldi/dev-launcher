@@ -1,49 +1,20 @@
 import { useEffect, useRef, useState } from "react";
-import type { LogPayload } from "@/types";
-import { onProfileLog } from "@/lib/tauri";
+import type { LogEntry } from "@/types";
 
-interface LogEntry {
-  id: number;
-  stepIndex: number;
-  source: string;
-  message: string;
-}
-
-let logId = 0;
-
-export default function LogPanel({ profileId }: { profileId: string }) {
-  const [entries, setEntries] = useState<LogEntry[]>([]);
+export default function LogPanel({ entries }: { entries: LogEntry[] }) {
   const bottomRef = useRef<HTMLDivElement>(null);
+  const [activeStepIndex, setActiveStepIndex] = useState<number | "all">("all");
 
-  useEffect(() => {
-    let unlisten: (() => void) | null = null;
-    let mounted = true;
+  // Group entries by step untuk tab navigation
+  const stepIndices = Array.from(
+    new Set(entries.map((e) => e.stepIndex))
+  ).sort((a, b) => a - b);
+  const filteredEntries =
+    activeStepIndex === "all"
+      ? entries
+      : entries.filter((e) => e.stepIndex === activeStepIndex);
 
-    onProfileLog((payload: LogPayload) => {
-      if (!mounted || payload.profileId !== profileId) return;
-      setEntries((prev) => {
-        const next = [...prev];
-        // Batasi jumlah baris supaya panel tetap ringan.
-        if (next.length > 2000) next.splice(0, next.length - 2000);
-        next.push({
-          id: ++logId,
-          stepIndex: payload.stepIndex,
-          source: payload.source,
-          message: payload.message,
-        });
-        return next;
-      });
-    }).then((un) => {
-      if (mounted) unlisten = un;
-      else un(); // Jika sudah unmount sebelum listener terpasang, langsung cleanup.
-    });
-
-    return () => {
-      mounted = false;
-      unlisten?.();
-    };
-  }, [profileId]);
-
+  // Auto-scroll ke bawah saat ada log baru
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [entries]);
@@ -57,8 +28,39 @@ export default function LogPanel({ profileId }: { profileId: string }) {
   }
 
   return (
-    <div className="h-full overflow-y-auto rounded-md bg-zinc-950 p-3 font-mono text-xs leading-relaxed">
-      {entries.map((e) => (
+    <div className="flex h-full flex-col overflow-hidden">
+      {/* Tab buttons untuk switch antar step */}
+      {stepIndices.length > 1 && (
+        <div className="flex gap-1 border-b border-zinc-700 bg-zinc-900 p-2">
+          <button
+            onClick={() => setActiveStepIndex("all")}
+            className={`rounded px-3 py-1 text-xs font-medium transition-colors ${
+              activeStepIndex === "all"
+                ? "bg-zinc-700 text-white"
+                : "text-zinc-400 hover:bg-zinc-800 hover:text-zinc-300"
+            }`}
+          >
+            All
+          </button>
+          {stepIndices.map((idx) => (
+            <button
+              key={idx}
+              onClick={() => setActiveStepIndex(idx)}
+              className={`rounded px-3 py-1 text-xs font-medium transition-colors ${
+                activeStepIndex === idx
+                  ? "bg-zinc-700 text-white"
+                  : "text-zinc-400 hover:bg-zinc-800 hover:text-zinc-300"
+              }`}
+            >
+              Step {idx}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Log content */}
+      <div className="flex-1 overflow-y-auto rounded-md bg-zinc-950 p-3 font-mono text-xs leading-relaxed">
+        {filteredEntries.map((e) => (
         <div key={e.id} className="flex gap-2">
           <span className="shrink-0 select-none text-zinc-600">
             [{e.stepIndex}]
@@ -77,6 +79,7 @@ export default function LogPanel({ profileId }: { profileId: string }) {
         </div>
       ))}
       <div ref={bottomRef} />
+      </div>
     </div>
   );
 }
