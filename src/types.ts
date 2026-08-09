@@ -6,6 +6,8 @@ export type Step =
 export interface Profile {
   id: string;
   name: string;
+  folder?: string | null;
+  order?: number;
   steps: Step[];
 }
 

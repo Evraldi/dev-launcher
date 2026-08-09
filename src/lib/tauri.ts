@@ -24,6 +24,15 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
 
 export const api = {
   listProfiles: () => call<Profile[]>("list_profiles"),
+  listFolders: () => call<string[]>("list_folders"),
+  createFolder: (name: string) => call<void>("create_folder", { name }),
+  renameFolder: (oldName: string, newName: string) =>
+    call<void>("rename_folder", { old: oldName, new: newName }),
+  deleteFolder: (name: string) => call<void>("delete_folder", { name }),
+  moveProfile: (profileId: string, folder: string | null) =>
+    call<void>("move_profile", { profileId, folder }),
+  reorderProfiles: (profileIds: string[]) =>
+    call<void>("reorder_profiles", { profileIds }),
   saveProfile: (profile: Profile) => call<void>("save_profile", { profile }),
   deleteProfile: (profileId: string) =>
     call<void>("delete_profile", { profileId }),

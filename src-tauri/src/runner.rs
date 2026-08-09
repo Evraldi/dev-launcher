@@ -30,7 +30,7 @@ struct LogPayload {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct StatusPayload {
+pub(crate) struct StatusPayload {
     profile_id: String,
     status: String, // "starting" | "running" | "stopped" | "failed"
     message: String,
@@ -61,15 +61,25 @@ pub fn find_conflicts(profile: &Profile) -> Result<Vec<PortConflict>, String> {
             port: Some(port), ..
         } = step
         {
+            // TCP: hanya peduli status LISTENING. UDP tidak punya status, tapi
+            // tetap dianggap bentrok kalau port dipakai. PID 0 (System Idle /
+            // listener kernel) tidak bisa dibunuh dan tak relevan sebagai konflik.
             let used: Vec<_> = active
                 .iter()
-                .filter(|p| p.port == *port && p.status == "LISTENING")
+                .filter(|p| {
+                    p.port == *port
+                        && p.pid != 0
+                        && (p.protocol == "UDP" || p.status == "LISTENING")
+                })
                 .collect();
             if !used.is_empty() {
+                let mut pids = used.iter().map(|p| p.pid).collect::<Vec<_>>();
+                pids.sort_unstable();
+                pids.dedup();
                 conflicts.push(PortConflict {
                     step_index: idx,
                     port: *port,
-                    pids: used.iter().map(|p| p.pid).collect(),
+                    pids,
                     process_names: used.iter().map(|p| p.process_name.clone()).collect(),
                 });
             }
@@ -85,6 +95,21 @@ fn emit_log(app: &AppHandle, payload: LogPayload) {
 
 fn emit_status(app: &AppHandle, payload: StatusPayload) {
     let _ = app.emit("profile-status", payload);
+}
+
+/// Helper agar modul lain (mis. `lib.rs`) bisa mengirim status profile.
+pub(crate) fn status_payload(
+    profile_id: &str,
+    status: &str,
+    message: String,
+    step_index: Option<usize>,
+) -> StatusPayload {
+    StatusPayload {
+        profile_id: profile_id.to_string(),
+        status: status.to_string(),
+        message,
+        step_index,
+    }
 }
 
 fn emit_log_plain(app: &AppHandle, profile_id: &str, step_index: usize, source: &str, msg: &str) {
@@ -163,7 +188,6 @@ async fn spawn_command_step(
     // Hindari munculnya console window di Windows
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         command.creation_flags(util::CREATE_NO_WINDOW);
     }
 
@@ -243,6 +267,23 @@ pub async fn start_profile(
         .ok_or_else(|| format!("Profile {profile_id} tidak ditemukan"))?
         .clone();
 
+    // Guard: jangan start ulang kalau profil ini masih punya proses hidup.
+    {
+        let registry = state.inner().clone();
+        let alive = registry
+            .processes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&profile_id)
+            .map(|p| p.len())
+            .unwrap_or(0);
+        if alive > 0 {
+            return Err(format!(
+                "Profile {profile_id} sedang berjalan ({alive} proses) — stop dulu sebelum start ulang."
+            ));
+        }
+    }
+
     emit_status(
         &app,
         StatusPayload {
@@ -256,7 +297,10 @@ pub async fn start_profile(
     let mut pids: Vec<StepPid> = Vec::new();
     let registry = state.inner().clone();
 
-    for (idx, step) in profile.steps.iter().enumerate() {
+    // Kalau ada step yang gagal di tengah, bunuh semua proses yang sudah
+    // dijalankan supaya tidak meninggalkan orphan (rollback).
+    let result = async {
+        for (idx, step) in profile.steps.iter().enumerate() {
         emit_status(
             &app,
             StatusPayload {
@@ -283,16 +327,15 @@ pub async fn start_profile(
                 }
 
                 // Build command dengan CREATE_NO_WINDOW flag untuk hindari console window
-                let mut cmd = std::process::Command::new(path);
+                let mut cmd = TokioCommand::new(path);
                 #[cfg(windows)]
                 {
-                    use std::os::windows::process::CommandExt;
                     cmd.creation_flags(util::CREATE_NO_WINDOW);
                 }
 
                 match cmd.spawn() {
-                    Ok(child) => {
-                        let pid = child.id();
+                    Ok(mut child) => {
+                        let pid = child.id().unwrap_or(0);
                         pids.push(StepPid {
                             step_index: idx,
                             pid,
@@ -314,6 +357,22 @@ pub async fn start_profile(
                             "system",
                             &format!("[step {idx}] exe: {path} (pid {pid})"),
                         );
+
+                        // Hapus PID dari registry saat exe selesai keluar,
+                        // agar stop tidak menyasar proses yang sudah mati.
+                        let registry2 = registry.clone();
+                        let pid_str = profile_id.clone();
+                        tokio::spawn(async move {
+                            let _ = child.wait().await;
+                            if let Ok(mut map) = registry2.processes.lock() {
+                                if let Some(pids) = map.get_mut(&pid_str) {
+                                    pids.retain(|p| *p != pid);
+                                    if pids.is_empty() {
+                                        map.remove(&pid_str);
+                                    }
+                                }
+                            }
+                        });
                     }
                     Err(e) => {
                         emit_status(
@@ -357,6 +416,26 @@ pub async fn start_profile(
                 let _ = open_url(url);
             }
         }
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Err(err) = result {
+        // Rollback: bunuh semua proses yang sudah dijalankan step sebelumnya.
+        for sp in pids {
+            kill_tree(sp.pid);
+        }
+        emit_status(
+            &app,
+            StatusPayload {
+                profile_id: profile_id.clone(),
+                status: "failed".into(),
+                message: format!("Gagal: {err}"),
+                step_index: None,
+            },
+        );
+        return Err(err);
     }
 
     emit_status(
@@ -411,7 +490,7 @@ pub fn stop_profile(
 /// `cmd.exe` yang membungkus `npm.cmd` yang membungkus `node` — membunuh
 /// hanya satu PID saja tidak cukup.
 #[cfg(windows)]
-fn kill_tree(pid: u32) {
+pub(crate) fn kill_tree(pid: u32) {
     use std::os::windows::process::CommandExt;
     let _ = std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
@@ -420,7 +499,7 @@ fn kill_tree(pid: u32) {
 }
 
 #[cfg(not(windows))]
-fn kill_tree(pid: u32) {
+pub(crate) fn kill_tree(pid: u32) {
     let mut sys = sysinfo::System::new_all();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     if let Some(proc) = sys.process(sysinfo::Pid::from_u32(pid)) {

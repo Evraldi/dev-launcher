@@ -1,7 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { Profile, Step } from "@/types";
+import { api } from "@/lib/tauri";
 
 interface Props {
   initial?: Profile | null;
@@ -21,8 +22,25 @@ export default function ProfileForm({ initial, onSave, onCancel }: Props) {
   const [steps, setSteps] = useState<Step[]>(
     initial?.steps.length ? initial.steps : [emptyStep()]
   );
+  const [folders, setFolders] = useState<string[]>([]);
+  const [folder, setFolder] = useState(initial?.folder ?? "");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const list = await api.listFolders();
+        if (!cancelled) setFolders(list);
+      } catch {
+        // Form tetap bisa dipakai walau folder gagal dimuat.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   function updateStep(idx: number, patch: Partial<Step>) {
     setSteps((prev) =>
@@ -72,6 +90,8 @@ export default function ProfileForm({ initial, onSave, onCancel }: Props) {
     const profile: Profile = {
       id: initial?.id ?? crypto.randomUUID(),
       name: name.trim(),
+      folder: folder.trim() ? folder.trim() : null,
+      order: initial?.order ?? 0,
       steps: validSteps,
     };
     setSaving(true);
@@ -99,6 +119,24 @@ export default function ProfileForm({ initial, onSave, onCancel }: Props) {
           placeholder="Contoh: Jubelio Clone"
           className="w-full rounded-md border border-zinc-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
         />
+      </div>
+
+      <div>
+        <label className="mb-1 block text-sm font-medium text-zinc-700">
+          Folder
+        </label>
+        <select
+          value={folder}
+          onChange={(e) => setFolder(e.target.value)}
+          className="w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
+        >
+          <option value="">Tanpa Folder</option>
+          {folders.map((f) => (
+            <option key={f} value={f}>
+              {f}
+            </option>
+          ))}
+        </select>
       </div>
 
       <div className="flex flex-col gap-2">

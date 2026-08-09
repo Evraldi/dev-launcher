@@ -5,7 +5,30 @@ use serde::{Deserialize, Serialize};
 pub struct Profile {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub order: u32,
     pub steps: Vec<Step>,
+}
+
+/// Bentuk penyimpanan profil + folder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Store {
+    #[serde(default)]
+    pub folders: Vec<String>,
+    #[serde(default)]
+    pub profiles: Vec<Profile>,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Store {
+            folders: Vec::new(),
+            profiles: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
