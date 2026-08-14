@@ -9,19 +9,36 @@ import type {
   Profile,
   ProfileStatus,
   StatusPayload,
+  StepRuntimeState,
+  StepStatusPayload,
 } from "@/types";
 import ProfileForm from "@/components/ProfileForm";
 import LogPanel from "@/components/LogPanel";
 import StatusDot from "@/components/StatusDot";
 import ConflictModal from "@/components/ConflictModal";
 import FolderSection from "@/components/FolderSection";
-import { api, isTauri, onProfileStatus, onProfileLog } from "@/lib/tauri";
+import { api, isTauri, onProfileStatus, onProfileLog, onProfileStepStatus } from "@/lib/tauri";
 
 function subscribeNoop(): () => void {
   return () => {};
 }
 
 let logId = 0;
+
+function parsePersistedLogLine(line: string): {
+  stepIndex: number;
+  source: "stdout" | "stderr" | "system";
+  message: string;
+} {
+  const m = line.match(/^\[[^\]]*\] \[step (\d+)\] \[([^\]]*)\] (.*)$/);
+  if (!m) return { stepIndex: 0, source: "system", message: line };
+  const src = m[2];
+  return {
+    stepIndex: Number(m[1]),
+    source: src === "stdout" || src === "stderr" ? src : "system",
+    message: m[3],
+  };
+}
 
 type DropTarget =
   | { kind: "folder"; folder: string | null }
@@ -43,12 +60,17 @@ export default function Home() {
   const [profileLogs, setProfileLogs] = useState<Record<string, LogEntry[]>>(
     {}
   );
+  const [stepStatuses, setStepStatuses] = useState<
+    Record<string, Record<number, StepRuntimeState>>
+  >({});
+  const [logTab, setLogTab] = useState<number | "all">("all");
   // Manajemen folder
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
   const [renamingFolder, setRenamingFolder] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [collapsedFolders, setCollapsedFolders] = useState<Record<string, boolean>>({});
+  const [search, setSearch] = useState("");
   // Drag & drop (pointer-based, lebih andal di WebView daripada HTML5 DnD)
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<DropTarget>(null);
@@ -62,6 +84,7 @@ export default function Home() {
   const dropTargetRef = useRef<DropTarget>(null);
   const suppressClickRef = useRef(false);
   const profilesRef = useRef(profiles);
+  const seededLogsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     profilesRef.current = profiles;
@@ -146,6 +169,30 @@ export default function Home() {
         ...prev,
         [payload.profileId]: payload.status,
       }));
+      if (payload.status === "stopped" || payload.status === "failed") {
+        setStepStatuses((prev) => {
+          const next = { ...prev };
+          delete next[payload.profileId];
+          return next;
+        });
+      }
+    }).then((un) => (unlisten = un));
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: (() => void) | null = null;
+    onProfileStepStatus((payload: StepStatusPayload) => {
+      setStepStatuses((prev) => ({
+        ...prev,
+        [payload.profileId]: {
+          ...(prev[payload.profileId] ?? {}),
+          [payload.stepIndex]: payload.state,
+        },
+      }));
     }).then((un) => (unlisten = un));
     return () => {
       unlisten?.();
@@ -208,16 +255,18 @@ export default function Home() {
     }
   }
 
-  async function handleUseAltPort() {
-    // Catatan: auto-ganti port tidak bisa untuk semua project.
-    // Untuk sekarang kita hanya memberi tahu user bahwa fitur ini
-    // hanya berlaku untuk project yang membaca env PORT/APP_PORT.
+  async function handleUseAltPort(overrides: Record<number, number>) {
     if (!pendingStartId) return;
-    setConflicts(null);
-    setPendingStartId(null);
-    setError(
-      "Ganti port otomatis hanya didukung untuk project yang membaca env PORT/APP_PORT. Silakan set port alternatif di form profile, atau kill proses yang bentrok."
-    );
+    setStarting(true);
+    try {
+      setConflicts(null);
+      await api.startProfileWithPorts(pendingStartId, overrides);
+      setPendingStartId(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setStarting(false);
+    }
   }
 
   async function handleStop(id: string) {
@@ -230,6 +279,40 @@ export default function Home() {
 
   function selectActive(id: string) {
     setActiveProfileId(id);
+    setLogTab("all");
+    loadPersistedLogs(id);
+  }
+
+  // Muat log yang dipersist dari disk sekali per profile per sesi.
+  async function loadPersistedLogs(id: string) {
+    if (seededLogsRef.current.has(id)) return;
+    seededLogsRef.current.add(id);
+    try {
+      const lines = await api.readProfileLog(id);
+      const entries: LogEntry[] = lines.map((line) => ({
+        id: ++logId,
+        ...parsePersistedLogLine(line),
+      }));
+      if (entries.length > 0) {
+        setProfileLogs((prev) => ({
+          ...prev,
+          [id]: entries.slice(-2000),
+        }));
+      }
+    } catch {
+      // Gagal membaca log persist — biarkan log live tetap berfungsi.
+    }
+  }
+
+  async function handleClearLog(id: string) {
+    try {
+      await api.clearProfileLog(id);
+      seededLogsRef.current.delete(id);
+      setProfileLogs((prev) => ({ ...prev, [id]: [] }));
+      setLogTab("all");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
   }
 
   // ---- Manajemen folder ----
@@ -461,6 +544,106 @@ export default function Home() {
     });
   }
 
+  // ---- Pencarian ----
+
+  const query = search.trim().toLowerCase();
+  const isSearching = query.length > 0;
+  const searchMatches = (p: Profile) =>
+    p.name.toLowerCase().includes(query) ||
+    p.steps.some((s) => {
+      const haystack =
+        s.type === "exe" ? s.path : s.type === "command" ? s.cmd : s.url;
+      return haystack.toLowerCase().includes(query);
+    });
+  const searchResults = isSearching
+    ? profiles
+        .filter(searchMatches)
+        .slice()
+        .sort(
+          (a, b) =>
+            (a.folder ?? "").localeCompare(b.folder ?? "") ||
+            (a.order ?? 0) - (b.order ?? 0) ||
+            a.name.localeCompare(b.name)
+        )
+    : [];
+
+  function renderProfileCard(p: Profile) {
+    const status = statuses[p.id] ?? "stopped";
+    const isProfileTarget =
+      dropTarget?.kind === "profile" && dropTarget.id === p.id;
+    return (
+      <div
+        key={p.id}
+        data-profile-id={p.id}
+        onPointerDown={(e) => onProfilePointerDown(e, p.id)}
+        onClick={() => handleCardClick(p.id)}
+        className={`relative cursor-pointer select-none rounded-md border p-3 transition-colors ${
+          activeProfileId === p.id
+            ? "border-blue-500 bg-blue-50"
+            : "border-zinc-200 bg-white hover:border-zinc-300"
+        } ${draggingId === p.id ? "opacity-40" : ""}`}
+      >
+        {isProfileTarget && !dropTarget!.after && (
+          <span className="absolute -top-1 left-2 right-2 h-0.5 rounded bg-emerald-500" />
+        )}
+        {isProfileTarget && dropTarget!.after && (
+          <span className="absolute -bottom-1 left-2 right-2 h-0.5 rounded bg-emerald-500" />
+        )}
+        <div className="flex items-start justify-between gap-2">
+          <div className="min-w-0">
+            <p className="truncate text-sm font-semibold">{p.name}</p>
+            <p className="mt-0.5 truncate text-xs text-zinc-500">
+              {p.steps.length} step
+            </p>
+          </div>
+          <StatusDot status={status} />
+        </div>
+        <div className="mt-3 flex items-center gap-2">
+          {status === "running" || status === "starting" ? (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                handleStop(p.id);
+              }}
+              className="rounded-md bg-zinc-800 px-3 py-1.5 text-xs font-medium text-white hover:bg-zinc-900"
+            >
+              Stop
+            </button>
+          ) : (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                startProfileWithCheck(p.id);
+              }}
+              disabled={starting}
+              className="rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+            >
+              Start
+            </button>
+          )}
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              setEditing(p);
+            }}
+            className="rounded-md border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
+          >
+            Edit
+          </button>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              handleDelete(p.id);
+            }}
+            className="rounded-md border border-red-200 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50"
+          >
+            Hapus
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <main className="flex h-screen flex-col overflow-hidden bg-zinc-50 text-zinc-900">
       <header className="flex items-center justify-between border-b border-zinc-200 bg-white px-6 py-4">
@@ -519,6 +702,14 @@ export default function Home() {
                 + Folder
               </button>
             </div>
+            <div className="mb-3">
+              <input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Cari profile…"
+                className="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm focus:border-blue-500 focus:outline-none"
+              />
+            </div>
             {creatingFolder && (
               <form
                 onSubmit={handleCreateFolder}
@@ -550,7 +741,17 @@ export default function Home() {
               </form>
             )}
 
-            {profiles.length === 0 && !editing && !creatingFolder ? (
+            {isSearching ? (
+              searchResults.length === 0 ? (
+                <p className="mt-8 text-center text-sm text-zinc-500">
+                  Tidak ada profile yang cocok dengan &ldquo;{search}&rdquo;.
+                </p>
+              ) : (
+                <div className="flex flex-col gap-3">
+                  {searchResults.map(renderProfileCard)}
+                </div>
+              )
+            ) : profiles.length === 0 && !editing && !creatingFolder ? (
               <p className="mt-8 text-center text-sm text-zinc-500">
                 Belum ada profile. Klik &ldquo;+ Tambah Profile&rdquo; untuk
                 memulai.
@@ -592,85 +793,7 @@ export default function Home() {
                       }}
                       dropKey={key}
                     >
-                      {g.profiles.map((p) => {
-                        const status = statuses[p.id] ?? "stopped";
-                        const isProfileTarget =
-                          dropTarget?.kind === "profile" &&
-                          dropTarget.id === p.id;
-                        return (
-                          <div
-                            key={p.id}
-                            data-profile-id={p.id}
-                            onPointerDown={(e) => onProfilePointerDown(e, p.id)}
-                            onClick={() => handleCardClick(p.id)}
-                            className={`relative cursor-pointer select-none rounded-md border p-3 transition-colors ${
-                              activeProfileId === p.id
-                                ? "border-blue-500 bg-blue-50"
-                                : "border-zinc-200 bg-white hover:border-zinc-300"
-                            } ${draggingId === p.id ? "opacity-40" : ""}`}
-                          >
-                            {isProfileTarget && !dropTarget!.after && (
-                              <span className="absolute -top-1 left-2 right-2 h-0.5 rounded bg-emerald-500" />
-                            )}
-                            {isProfileTarget && dropTarget!.after && (
-                              <span className="absolute -bottom-1 left-2 right-2 h-0.5 rounded bg-emerald-500" />
-                            )}
-                            <div className="flex items-start justify-between gap-2">
-                              <div className="min-w-0">
-                                <p className="truncate text-sm font-semibold">
-                                  {p.name}
-                                </p>
-                                <p className="mt-0.5 truncate text-xs text-zinc-500">
-                                  {p.steps.length} step
-                                </p>
-                              </div>
-                              <StatusDot status={status} />
-                            </div>
-                            <div className="mt-3 flex items-center gap-2">
-                              {status === "running" || status === "starting" ? (
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleStop(p.id);
-                                  }}
-                                  className="rounded-md bg-zinc-800 px-3 py-1.5 text-xs font-medium text-white hover:bg-zinc-900"
-                                >
-                                  Stop
-                                </button>
-                              ) : (
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    startProfileWithCheck(p.id);
-                                  }}
-                                  disabled={starting}
-                                  className="rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
-                                >
-                                  Start
-                                </button>
-                              )}
-                              <button
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setEditing(p);
-                                }}
-                                className="rounded-md border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
-                              >
-                                Edit
-                              </button>
-                              <button
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  handleDelete(p.id);
-                                }}
-                                className="rounded-md border border-red-200 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50"
-                              >
-                                Hapus
-                              </button>
-                            </div>
-                          </div>
-                        );
-                      })}
+                      {g.profiles.map(renderProfileCard)}
                     </FolderSection>
                   );
                 })}
@@ -697,10 +820,72 @@ export default function Home() {
                     {profiles.find((p) => p.id === activeProfileId)?.name ??
                       "Profile"}
                   </h2>
-                  <StatusDot status={statuses[activeProfileId] ?? "stopped"} />
+                  <div className="flex items-center gap-2">
+                    <StatusDot
+                      status={statuses[activeProfileId] ?? "stopped"}
+                    />
+                    <button
+                      onClick={() => handleClearLog(activeProfileId)}
+                      className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-600 hover:bg-zinc-50"
+                      title="Hapus log yang disimpan di disk"
+                    >
+                      Bersihkan Log
+                    </button>
+                  </div>
                 </div>
+                {(() => {
+                  const activeProfile = profiles.find(
+                    (p) => p.id === activeProfileId
+                  );
+                  if (!activeProfile || activeProfile.steps.length === 0)
+                    return null;
+                  return (
+                    <div className="mb-2 flex flex-wrap gap-1.5">
+                      {activeProfile.steps.map((step, idx) => {
+                        const state = stepStatuses[activeProfileId]?.[idx];
+                        const port =
+                          step.type === "command" ? step.port : null;
+                        const label =
+                          step.type === "exe"
+                            ? step.path
+                            : step.type === "command"
+                            ? step.cmd
+                            : step.url;
+                        const chip =
+                          state === "ready"
+                            ? "bg-emerald-100 text-emerald-700 border-emerald-300"
+                            : state === "spawned"
+                            ? "bg-blue-100 text-blue-700 border-blue-300"
+                            : state === "timeout"
+                            ? "bg-amber-100 text-amber-700 border-amber-300"
+                            : "bg-zinc-100 text-zinc-500 border-zinc-200";
+                        const kindLabel =
+                          step.type === "exe"
+                            ? "exe"
+                            : step.type === "command"
+                            ? "cmd"
+                            : "url";
+                        return (
+                          <button
+                            key={idx}
+                            onClick={() => setLogTab(idx)}
+                            title={label}
+                            className={`max-w-56 truncate rounded-md border px-2 py-1 text-xs font-medium transition-colors ${chip}`}
+                          >
+                            {idx} · {kindLabel}
+                            {port ? ` :${port}` : ""}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
                 <div className="min-h-0 flex-1">
-                  <LogPanel entries={profileLogs[activeProfileId] || []} />
+                  <LogPanel
+                    entries={profileLogs[activeProfileId] || []}
+                    activeStepIndex={logTab}
+                    onStepChange={setLogTab}
+                  />
                 </div>
               </>
             ) : (

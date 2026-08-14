@@ -124,6 +124,28 @@ pub fn get_active_ports() -> Result<Vec<PortInfo>, String> {
     Ok(ports)
 }
 
+/// Cari port bebas mulai dari `start` (naik ke atas, wrap di 65535).
+/// Port 0 dan ephemeral range di-skip supaya tidak dapet port sistem.
+#[tauri::command]
+pub fn find_free_port(start: u16) -> Result<u16, String> {
+    let used: std::collections::HashSet<u16> = get_active_ports()?
+        .iter()
+        .map(|p| p.port)
+        .collect();
+    let start = start.max(1);
+    for offset in 0..u16::MAX as u32 {
+        let candidate = (start as u32 + offset) % 65536;
+        if candidate == 0 {
+            continue;
+        }
+        let candidate = candidate as u16;
+        if !used.contains(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err("Tidak ada port bebas yang ditemukan.".into())
+}
+
 #[tauri::command]
 pub fn kill_process(pid: u32) -> Result<(), String> {
     let mut sys = System::new();

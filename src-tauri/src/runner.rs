@@ -9,14 +9,25 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
+use tokio::net::TcpStream;
 use tokio::process::Command as TokioCommand;
+
+/// Profil yang sedang berjalan: daftar PID child + flag apakah urutan
+/// start sudah selesai (untuk deteksi "keluar sendiri" tanpa false positive
+/// saat start masih berlangsung).
+#[derive(Default)]
+pub struct RunningProfile {
+    pub pids: Vec<u32>,
+    pub started: bool,
+}
 
 /// PID child process yang masih hidup per profile.
 #[derive(Default)]
 pub struct RunningRegistry {
-    pub processes: Mutex<HashMap<String, Vec<u32>>>,
+    pub processes: Mutex<HashMap<String, RunningProfile>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -35,6 +46,15 @@ pub(crate) struct StatusPayload {
     status: String, // "starting" | "running" | "stopped" | "failed"
     message: String,
     step_index: Option<usize>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct StepStatusPayload {
+    profile_id: String,
+    step_index: usize,
+    state: String, // "spawned" | "ready" | "timeout"
+    port: Option<u16>,
 }
 
 #[derive(Serialize, Clone)]
@@ -97,6 +117,78 @@ fn emit_status(app: &AppHandle, payload: StatusPayload) {
     let _ = app.emit("profile-status", payload);
 }
 
+fn emit_step_status(app: &AppHandle, payload: StepStatusPayload) {
+    let _ = app.emit("profile-step-status", payload);
+}
+
+/// Tunggu sampai port bisa di-connect (poll tiap 500ms) atau timeout.
+/// Coba `127.0.0.1` dulu, lalu `::1` (server yang bind ke 0.0.0.0 tetap
+/// kebaca lewat loopback).
+async fn wait_for_port(port: u16, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            return true;
+        }
+        if TcpStream::connect(("::1", port)).await.is_ok() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Health check port sebuah step command: emit `spawned` → poll → `ready`/`timeout`.
+/// Timeout hanya log peringatan, profile tetap lanjut.
+async fn check_step_port(
+    app: &AppHandle,
+    profile_id: &str,
+    step_index: usize,
+    port: u16,
+) {
+    emit_step_status(
+        app,
+        StepStatusPayload {
+            profile_id: profile_id.to_string(),
+            step_index,
+            state: "spawned".into(),
+            port: Some(port),
+        },
+    );
+    let ready = wait_for_port(port, Duration::from_secs(30)).await;
+    let state = if ready { "ready" } else { "timeout" };
+    emit_step_status(
+        app,
+        StepStatusPayload {
+            profile_id: profile_id.to_string(),
+            step_index,
+            state: state.into(),
+            port: Some(port),
+        },
+    );
+    if ready {
+        emit_log_plain(
+            app,
+            profile_id,
+            step_index,
+            "system",
+            &format!("[step {step_index}] port {port} siap menerima koneksi."),
+        );
+    } else {
+        emit_log_plain(
+            app,
+            profile_id,
+            step_index,
+            "system",
+            &format!(
+                "[step {step_index}] port {port} belum siap dalam 30 detik — lanjut ke step berikutnya."
+            ),
+        );
+    }
+}
+
 /// Helper agar modul lain (mis. `lib.rs`) bisa mengirim status profile.
 pub(crate) fn status_payload(
     profile_id: &str,
@@ -113,6 +205,7 @@ pub(crate) fn status_payload(
 }
 
 fn emit_log_plain(app: &AppHandle, profile_id: &str, step_index: usize, source: &str, msg: &str) {
+    crate::storage::append_log_line(profile_id, step_index, source, msg);
     emit_log(
         app,
         LogPayload {
@@ -122,6 +215,36 @@ fn emit_log_plain(app: &AppHandle, profile_id: &str, step_index: usize, source: 
             message: msg.to_string(),
         },
     );
+}
+
+/// Baca stream stdout/stderr baris per baris dengan fallback lossy untuk byte
+/// non-UTF8 (umum terjadi pada output Windows). Tanpa ini, satu baris invalid
+/// akan menghentikan seluruh streaming karena `AsyncBufReadExt::lines()`
+/// mengembalikan `Err` dan loop berhenti diam-diam.
+async fn stream_lines<R>(
+    reader: R,
+    app: AppHandle,
+    profile_id: String,
+    step_index: usize,
+    source: &'static str,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    let mut reader = BufReader::new(reader);
+    let mut buf = Vec::with_capacity(256);
+    loop {
+        buf.clear();
+        let n = match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        let line = String::from_utf8_lossy(&buf[..n]);
+        let line = line.strip_suffix('\n').unwrap_or(&line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        emit_log_plain(&app, &profile_id, step_index, source, line);
+    }
 }
 
 /// Bangun `TokioCommand` untuk menjalankan sebuah command step.
@@ -201,7 +324,7 @@ async fn spawn_command_step(
             .processes
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        map.entry(profile_id.to_string()).or_default().push(pid);
+        map.entry(profile_id.to_string()).or_default().pids.push(pid);
     }
 
     let label = format!("{} {}", program, args.join(" "));
@@ -217,36 +340,47 @@ async fn spawn_command_step(
     if let Some(out) = child.stdout.take() {
         let app2 = app.clone();
         let pid2 = profile_id.to_string();
-        let mut lines = BufReader::new(out).lines();
-        tokio::spawn(async move {
-            while let Ok(Some(line)) = lines.next_line().await {
-                emit_log_plain(&app2, &pid2, step_index, "stdout", &line);
-            }
-        });
+        tokio::spawn(stream_lines(out, app2, pid2, step_index, "stdout"));
     }
     if let Some(err) = child.stderr.take() {
         let app2 = app.clone();
         let pid2 = profile_id.to_string();
-        let mut lines = BufReader::new(err).lines();
-        tokio::spawn(async move {
-            while let Ok(Some(line)) = lines.next_line().await {
-                emit_log_plain(&app2, &pid2, step_index, "stderr", &line);
-            }
-        });
+        tokio::spawn(stream_lines(err, app2, pid2, step_index, "stderr"));
     }
 
-    // Hapus PID dari registry saat process keluar.
+    // Hapus PID dari registry saat process keluar. Kalau ini proses terakhir
+    // dan profile sudah selesai di-start, anggap profile selesai (emit stopped).
     let registry2 = registry.clone();
+    let app2 = app.clone();
     let pid_str = profile_id.to_string();
     tokio::spawn(async move {
         let _ = child.wait().await;
-        if let Ok(mut map) = registry2.processes.lock() {
-            if let Some(pids) = map.get_mut(&pid_str) {
-                pids.retain(|p| *p != pid);
-                if pids.is_empty() {
+        let finished = {
+            if let Ok(mut map) = registry2.processes.lock() {
+                let done = if let Some(rp) = map.get_mut(&pid_str) {
+                    rp.pids.retain(|p| *p != pid);
+                    rp.pids.is_empty() && rp.started
+                } else {
+                    false
+                };
+                if done {
                     map.remove(&pid_str);
                 }
+                done
+            } else {
+                false
             }
+        };
+        if finished {
+            emit_status(
+                &app2,
+                status_payload(
+                    &pid_str,
+                    "stopped",
+                    "Semua proses selesai.".into(),
+                    None,
+                ),
+            );
         }
     });
 
@@ -254,11 +388,13 @@ async fn spawn_command_step(
 }
 
 /// Jalankan semua step sebuah profile secara berurutan.
+/// `port_overrides` memetakan index step ke port pengganti (opsional).
 #[tauri::command]
 pub async fn start_profile(
     app: AppHandle,
     state: tauri::State<'_, Arc<RunningRegistry>>,
     profile_id: String,
+    port_overrides: Option<HashMap<usize, u16>>,
 ) -> Result<StartResult, String> {
     let profiles = crate::storage::load_profiles()?;
     let profile = profiles
@@ -275,7 +411,7 @@ pub async fn start_profile(
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(&profile_id)
-            .map(|p| p.len())
+            .map(|p| p.pids.len())
             .unwrap_or(0);
         if alive > 0 {
             return Err(format!(
@@ -295,6 +431,7 @@ pub async fn start_profile(
     );
 
     let mut pids: Vec<StepPid> = Vec::new();
+    let mut checked_ports = false;
     let registry = state.inner().clone();
 
     // Kalau ada step yang gagal di tengah, bunuh semua proses yang sudah
@@ -348,6 +485,7 @@ pub async fn start_profile(
                                 .unwrap_or_else(|p| p.into_inner());
                             map.entry(profile_id.clone())
                                 .or_default()
+                                .pids
                                 .push(pid);
                         }
                         emit_log_plain(
@@ -361,16 +499,36 @@ pub async fn start_profile(
                         // Hapus PID dari registry saat exe selesai keluar,
                         // agar stop tidak menyasar proses yang sudah mati.
                         let registry2 = registry.clone();
+                        let app2 = app.clone();
                         let pid_str = profile_id.clone();
                         tokio::spawn(async move {
                             let _ = child.wait().await;
-                            if let Ok(mut map) = registry2.processes.lock() {
-                                if let Some(pids) = map.get_mut(&pid_str) {
-                                    pids.retain(|p| *p != pid);
-                                    if pids.is_empty() {
+                            let finished = {
+                                if let Ok(mut map) = registry2.processes.lock() {
+                                    let done = if let Some(rp) = map.get_mut(&pid_str) {
+                                        rp.pids.retain(|p| *p != pid);
+                                        rp.pids.is_empty() && rp.started
+                                    } else {
+                                        false
+                                    };
+                                    if done {
                                         map.remove(&pid_str);
                                     }
+                                    done
+                                } else {
+                                    false
                                 }
+                            };
+                            if finished {
+                                emit_status(
+                                    &app2,
+                                    status_payload(
+                                        &pid_str,
+                                        "stopped",
+                                        "Semua proses selesai.".into(),
+                                        None,
+                                    ),
+                                );
                             }
                         });
                     }
@@ -389,13 +547,31 @@ pub async fn start_profile(
                 }
             }
             Step::Command { cwd, cmd, port } => {
+                let effective_port = port_overrides
+                    .as_ref()
+                    .and_then(|m| m.get(&idx).copied())
+                    .or(*port);
+                if let Some(override_port) = port_overrides.as_ref().and_then(|m| m.get(&idx)) {
+                    if *port != Some(*override_port) {
+                        emit_log_plain(
+                            &app,
+                            &profile_id,
+                            idx,
+                            "system",
+                            &format!(
+                                "[step {idx}] port diganti {port:?} -> {override_port} (env PORT/APP_PORT). \
+                                 Step open_url yang mengarah ke port lama tidak otomatis berubah."
+                            ),
+                        );
+                    }
+                }
                 let pid = spawn_command_step(
                     app.clone(),
                     &profile_id,
                     idx,
                     cwd,
                     cmd,
-                    *port,
+                    effective_port,
                     registry.clone(),
                 )
                 .await?;
@@ -404,6 +580,10 @@ pub async fn start_profile(
                     pid,
                     label: cmd.clone(),
                 });
+                if let Some(p) = effective_port {
+                    checked_ports = true;
+                    check_step_port(&app, &profile_id, idx, p).await;
+                }
             }
             Step::OpenUrl { url } => {
                 emit_log_plain(
@@ -438,15 +618,51 @@ pub async fn start_profile(
         return Err(err);
     }
 
-    emit_status(
-        &app,
-        StatusPayload {
-            profile_id: profile_id.clone(),
-            status: "running".into(),
-            message: "Semua step selesai dijalankan.".into(),
-            step_index: None,
-        },
-    );
+    // Tandai start sudah selesai. Kalau tidak ada proses yang masih hidup
+    // (semua step short-lived, atau profile kosong), anggap profile langsung
+    // selesai — hindari UI nyangkut "running" padahal tidak ada proses.
+    let still_running = {
+        let mut map = registry
+            .processes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let has_pids = map
+            .get(&profile_id)
+            .map(|rp| !rp.pids.is_empty())
+            .unwrap_or(false);
+        if has_pids {
+            map.get_mut(&profile_id).unwrap().started = true;
+        } else {
+            map.remove(&profile_id);
+        }
+        has_pids
+    };
+
+    if still_running {
+        emit_status(
+            &app,
+            StatusPayload {
+                profile_id: profile_id.clone(),
+                status: "running".into(),
+                message: if checked_ports {
+                    "Semua step siap.".into()
+                } else {
+                    "Semua step selesai dijalankan.".into()
+                },
+                step_index: None,
+            },
+        );
+    } else {
+        emit_status(
+            &app,
+            status_payload(
+                &profile_id,
+                "stopped",
+                "Semua proses selesai.".into(),
+                None,
+            ),
+        );
+    }
 
     Ok(StartResult { pids })
 }
@@ -463,7 +679,10 @@ pub fn stop_profile(
             .processes
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let pids = map.remove(&profile_id).unwrap_or_default();
+        let pids = map
+            .remove(&profile_id)
+            .map(|rp| rp.pids)
+            .unwrap_or_default();
         let mut killed = Vec::new();
         for pid in pids {
             kill_tree(pid);

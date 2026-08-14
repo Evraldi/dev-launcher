@@ -54,6 +54,15 @@ export interface StatusPayload {
 
 export type ProfileStatus = "stopped" | "running" | "starting" | "failed";
 
+export type StepRuntimeState = "spawned" | "ready" | "timeout";
+
+export interface StepStatusPayload {
+  profileId: string;
+  stepIndex: number;
+  state: StepRuntimeState;
+  port: number | null;
+}
+
 export interface LogEntry {
   id: number;
   stepIndex: number;

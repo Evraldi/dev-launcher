@@ -172,7 +172,10 @@ fn delete_profile(
             .processes
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let pids = map.remove(&profile_id).unwrap_or_default();
+        let pids = map
+            .remove(&profile_id)
+            .map(|rp| rp.pids)
+            .unwrap_or_default();
         for pid in &pids {
             runner::kill_tree(*pid);
         }
@@ -204,6 +207,18 @@ fn check_port_conflicts(profile_id: String) -> Result<Vec<models::PortConflict>,
     runner::find_conflicts(profile)
 }
 
+/// Ambil log yang sudah dipersist ke disk untuk sebuah profile.
+#[tauri::command]
+fn read_profile_log(profile_id: String) -> Result<Vec<String>, String> {
+    storage::read_log_file(&profile_id)
+}
+
+/// Hapus log yang sudah dipersist untuk sebuah profile.
+#[tauri::command]
+fn clear_profile_log(profile_id: String) -> Result<(), String> {
+    storage::clear_log_file(&profile_id)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -220,7 +235,10 @@ pub fn run() {
             delete_profile,
             ports::get_active_ports,
             ports::kill_process,
+            ports::find_free_port,
             check_port_conflicts,
+            read_profile_log,
+            clear_profile_log,
             runner::start_profile,
             runner::stop_profile,
         ])
@@ -246,7 +264,7 @@ pub fn run() {
                     .processes
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
-                map.values().flatten().copied().collect()
+                map.values().flat_map(|rp| rp.pids.iter().copied()).collect()
             };
             for pid in pids {
                 runner::kill_tree(pid);

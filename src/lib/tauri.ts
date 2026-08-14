@@ -7,6 +7,7 @@ import type {
   Profile,
   StartResult,
   StatusPayload,
+  StepStatusPayload,
 } from "@/types";
 
 export function isTauri(): boolean {
@@ -38,10 +39,20 @@ export const api = {
     call<void>("delete_profile", { profileId }),
   getActivePorts: () => call<PortInfo[]>("get_active_ports"),
   killProcess: (pid: number) => call<void>("kill_process", { pid }),
+  findFreePort: (start: number) =>
+    call<number>("find_free_port", { start }),
   checkPortConflicts: (profileId: string) =>
     call<PortConflict[]>("check_port_conflicts", { profileId }),
+  readProfileLog: (profileId: string) =>
+    call<string[]>("read_profile_log", { profileId }),
+  clearProfileLog: (profileId: string) =>
+    call<void>("clear_profile_log", { profileId }),
   startProfile: (profileId: string) =>
     call<StartResult>("start_profile", { profileId }),
+  startProfileWithPorts: (
+    profileId: string,
+    portOverrides: Record<number, number>
+  ) => call<StartResult>("start_profile", { profileId, portOverrides }),
   stopProfile: (profileId: string) =>
     call<void>("stop_profile", { profileId }),
 };
@@ -56,4 +67,12 @@ export async function onProfileStatus(
   handler: (payload: StatusPayload) => void
 ): Promise<UnlistenFn> {
   return listen<StatusPayload>("profile-status", (e) => handler(e.payload));
+}
+
+export async function onProfileStepStatus(
+  handler: (payload: StepStatusPayload) => void
+): Promise<UnlistenFn> {
+  return listen<StepStatusPayload>("profile-step-status", (e) =>
+    handler(e.payload)
+  );
 }

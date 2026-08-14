@@ -1,18 +1,30 @@
 import { useEffect, useRef, useState } from "react";
 import type { LogEntry } from "@/types";
 
-export default function LogPanel({ entries }: { entries: LogEntry[] }) {
+interface Props {
+  entries: LogEntry[];
+  activeStepIndex?: number | "all";
+  onStepChange?: (step: number | "all") => void;
+}
+
+export default function LogPanel({ entries, activeStepIndex, onStepChange }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null);
-  const [activeStepIndex, setActiveStepIndex] = useState<number | "all">("all");
+  const [internalStep, setInternalStep] = useState<number | "all">("all");
+
+  const isControlled = activeStepIndex !== undefined;
+  const activeStep = isControlled ? activeStepIndex : internalStep;
+  const setStep = isControlled
+    ? (onStepChange ?? (() => {}))
+    : setInternalStep;
 
   // Group entries by step untuk tab navigation
   const stepIndices = Array.from(
     new Set(entries.map((e) => e.stepIndex))
   ).sort((a, b) => a - b);
   const filteredEntries =
-    activeStepIndex === "all"
+    activeStep === "all"
       ? entries
-      : entries.filter((e) => e.stepIndex === activeStepIndex);
+      : entries.filter((e) => e.stepIndex === activeStep);
 
   // Auto-scroll ke bawah saat ada log baru
   useEffect(() => {
@@ -33,9 +45,9 @@ export default function LogPanel({ entries }: { entries: LogEntry[] }) {
       {stepIndices.length > 1 && (
         <div className="flex gap-1 border-b border-zinc-700 bg-zinc-900 p-2">
           <button
-            onClick={() => setActiveStepIndex("all")}
+            onClick={() => setStep("all")}
             className={`rounded px-3 py-1 text-xs font-medium transition-colors ${
-              activeStepIndex === "all"
+              activeStep === "all"
                 ? "bg-zinc-700 text-white"
                 : "text-zinc-400 hover:bg-zinc-800 hover:text-zinc-300"
             }`}
@@ -45,9 +57,9 @@ export default function LogPanel({ entries }: { entries: LogEntry[] }) {
           {stepIndices.map((idx) => (
             <button
               key={idx}
-              onClick={() => setActiveStepIndex(idx)}
+              onClick={() => setStep(idx)}
               className={`rounded px-3 py-1 text-xs font-medium transition-colors ${
-                activeStepIndex === idx
+                activeStep === idx
                   ? "bg-zinc-700 text-white"
                   : "text-zinc-400 hover:bg-zinc-800 hover:text-zinc-300"
               }`}
