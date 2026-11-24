@@ -8,7 +8,7 @@ Aplikasi desktop untuk menjalankan seluruh proses yang dibutuhkan sebuah project
 - **Frontend**: Next.js (App Router, TypeScript, Tailwind CSS), static export
 - **Process management**: `std::process::Command` / `tokio::process` (Rust)
 - **Port detection**: reuse logic dari project [[port-monitor-tool]] — command `get_active_ports()` yang sama
-- **Storage**: profile project disimpan sebagai JSON lokal (`~/.dev-launcher/profiles.json`), tidak perlu database
+- **Storage**: dua berkas JSON lokal di `%APPDATA%\com.devlauncher.desktop\` — `profiles.json` (store internal UI, atomic + backup) dan `conf.jsonc` (override eksternal yang boleh diedit user/AI agent), tidak perlu database
 
 ## Setup / Install Commands
 
@@ -18,13 +18,13 @@ Prasyarat (kalau belum ada dari setup port-monitor sebelumnya, skip yang sudah t
 rustc --version
 cargo --version
 
-# 2. Cek Tauri CLI
-cargo tauri --version
-# kalau belum ada:
-cargo install tauri-cli
+# 2. Cek Tauri CLI (di project ini pakai CLI lewat npm, bukan cargo tauri)
+npx tauri --version
 ```
 
-Bikin project baru:
+Catatan: `cargo tauri` tidak terpasang di mesin ini. Selalu pakai `npm run tauri dev` / `npm run tauri build` dari root project.
+
+Riwayat pembuatan project (sudah dilakukan, tidak perlu dijalankan ulang):
 ```bash
 # 1. Buat folder & masuk
 cd D:\projek
@@ -36,7 +36,8 @@ npx create-next-app@latest .
 # pilihan: TypeScript Yes, ESLint Yes, React Compiler No,
 # Tailwind Yes, src/ dir Yes, App Router Yes, import alias default @/*
 
-# 3. Init Tauri di folder yang sama
+# 3. Init Tauri di folder yang sama (dulu memakai cargo tauri init;
+#    sekarang cukup pakai npm run tauri ... dari root project)
 cargo tauri init
 # App name: dev-launcher
 # Window title: dev launcher
@@ -75,22 +76,14 @@ const nextConfig: NextConfig = {
 
 ## Data Model
 
-Profile project (`~/.dev-launcher/profiles.json`):
-```json
-{
-  "profiles": [
-    {
-      "id": "uuid",
-      "name": "Jubelio Clone",
-      "steps": [
-        { "type": "exe", "path": "C:\\laragon\\laragon.exe" },
-        { "type": "command", "cwd": "D:\\laragon\\www\\jubelio-clone", "cmd": "npm run dev", "port": 3000 },
-        { "type": "open_url", "url": "http://localhost:3000" }
-      ]
-    }
-  ]
-}
-```
+Dua berkas, bukan duplikat data:
+
+| Berkas | Ditulis oleh | Fungsi |
+| --- | --- | --- |
+| `%APPDATA%\com.devlauncher.desktop\profiles.json` | UI aplikasi | Store internal (schema v2, atomic write + backup + recovery) |
+| `%APPDATA%\com.devlauncher.desktop\conf.jsonc` | User / AI agent | Profile & folder eksternal, read-only di UI, boleh pakai komentar & trailing comma |
+
+Aturan penting: agent cukup mengedit `conf.jsonc` untuk menambah profile/folder ke project tertentu; **jangan** menulis `profiles.json`. Kalau ID sama, versi `conf.jsonc` yang menang. Setelah edit, restart aplikasi. Format lengkap ada di README bagian "Konfigurasi lewat `conf.jsonc`" dan di `conf.example.jsonc`.
 
 ## Fitur Inti
 
@@ -153,10 +146,17 @@ fn delete_profile(profile_id: String) -> Result<(), String>
 6. Frontend: card list profile + log panel (kayak mockup yang sudah didesain)
 7. Integrasi deteksi port bentrok (reuse `get_active_ports` dari project port-monitor)
 8. Fitur stop/kill process
-9. Testing: `cargo tauri dev`
-10. Build: `cargo tauri build`
+9. Testing: `npm run tauri dev`
+10. Build: `npm run tauri build`
 
 ## Catatan
 - Kalau project [[port-monitor-tool]] sudah selesai duluan, logic Rust buat baca port (`netstat -ano` parsing) tinggal di-copy langsung ke project ini — nggak perlu bikin ulang dari nol.
 - Auto-kill proses sebaiknya selalu minta konfirmasi user dulu, jangan otomatis diam-diam (bisa berbahaya kalau proses itu bukan dev server sembarangan).
 - Step bertipe `command` yang portnya hardcoded di kode (bukan lewat env var) tidak bisa auto-ganti port — user harus edit source project itu sendiri.
+
+## Status Implementasi (v0.2.0)
+
+- **Fase 1–2**: atomic storage + backup/recovery, store lock, schema v2 & migrasi app-data, PID journal + reconcile, single instance, safe URL, kill-tree + verifikasi, log cleanup, start non-blocking, preflight, stop/start all, skip-existing, log batching.
+- **Fase 3**: toast/error inline, modal konfirmasi + unsaved guard, LogPanel pause/search/copy/export/wrap, busy per profile + quick restart + durasi/exit code, a11y/ARIA/focus trap + shortcut `Alt+↑/↓`, error boundary/empty/loading state, window state, `conf.jsonc`.
+- **Fase 4**: CSP ketat + `devCsp`, devtools mati di release, capability ACL minimal, validasi input backend terpusat, app log release dengan rotasi, test Rust/Vitest/Playwright, CI Windows, `CHANGELOG.md` + `docs/RELEASING.md`.
+- **Sengaja tidak masuk**: autostart, system tray, dark mode, updater, code signing, installer ter-sign (butuh sertifikat/kunci + endpoint updater).

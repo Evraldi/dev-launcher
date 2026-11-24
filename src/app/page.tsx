@@ -1,10 +1,19 @@
 "use client";
 
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
-import type { PointerEvent as ReactPointerEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import type {
+  KeyboardEvent as ReactKeyboardEvent,
+  PointerEvent as ReactPointerEvent,
+} from "react";
+import type {
+  ConfigStatus,
   LogEntry,
-  LogPayload,
   PortConflict,
   Profile,
   ProfileStatus,
@@ -16,28 +25,45 @@ import ProfileForm from "@/components/ProfileForm";
 import LogPanel from "@/components/LogPanel";
 import StatusDot from "@/components/StatusDot";
 import ConflictModal from "@/components/ConflictModal";
+import ConfirmDialog from "@/components/ConfirmDialog";
 import FolderSection from "@/components/FolderSection";
-import { api, isTauri, onProfileStatus, onProfileLog, onProfileStepStatus } from "@/lib/tauri";
+import ToastHost, { type ToastKind } from "@/components/ToastHost";
+import {
+  api,
+  isTauri,
+  nowMs,
+  onProfileStatus,
+  onProfileLogBatch,
+  onProfileStepStatus,
+} from "@/lib/tauri";
+import { formatDuration, parsePersistedLogLine } from "@/lib/format";
+import { groupProfiles } from "@/lib/groups";
 
 function subscribeNoop(): () => void {
   return () => {};
 }
 
 let logId = 0;
+let toastId = 0;
 
-function parsePersistedLogLine(line: string): {
-  stepIndex: number;
-  source: "stdout" | "stderr" | "system";
+interface ToastItem {
+  id: number;
   message: string;
-} {
-  const m = line.match(/^\[[^\]]*\] \[step (\d+)\] \[([^\]]*)\] (.*)$/);
-  if (!m) return { stepIndex: 0, source: "system", message: line };
-  const src = m[2];
-  return {
-    stepIndex: Number(m[1]),
-    source: src === "stdout" || src === "stderr" ? src : "system",
-    message: m[3],
-  };
+  kind: ToastKind;
+}
+
+type ConfirmState = {
+  title: string;
+  message: string;
+  confirmLabel?: string;
+  danger?: boolean;
+  onConfirm: () => void;
+};
+
+interface RunStats {
+  durationMs: number;
+  exitCode: number | null;
+  status: ProfileStatus;
 }
 
 type DropTarget =
@@ -51,12 +77,18 @@ export default function Home() {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [folders, setFolders] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const [confirmState, setConfirmState] = useState<ConfirmState | null>(null);
+  const [configStatus, setConfigStatus] = useState<ConfigStatus | null>(null);
+  const [runStats, setRunStats] = useState<Record<string, RunStats>>({});
   const [editing, setEditing] = useState<Profile | null | "new">(null);
   const [statuses, setStatuses] = useState<Record<string, ProfileStatus>>({});
   const [activeProfileId, setActiveProfileId] = useState<string | null>(null);
   const [conflicts, setConflicts] = useState<PortConflict[] | null>(null);
   const [pendingStartId, setPendingStartId] = useState<string | null>(null);
-  const [starting, setStarting] = useState(false);
+  const [busy, setBusy] = useState<Record<string, boolean>>({});
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [formDirty, setFormDirty] = useState(false);
   const [profileLogs, setProfileLogs] = useState<Record<string, LogEntry[]>>(
     {}
   );
@@ -67,7 +99,11 @@ export default function Home() {
   // Manajemen folder
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
-  const [renamingFolder, setRenamingFolder] = useState<string | null>(null);
+  // `undefined` = tidak sedang rename. `null` dipakai untuk grup "Tanpa Folder",
+  // jadi tidak boleh jadi nilai awal (kalau iya, form rename selalu muncul).
+  const [renamingFolder, setRenamingFolder] = useState<string | null | undefined>(
+    undefined
+  );
   const [renameValue, setRenameValue] = useState("");
   const [collapsedFolders, setCollapsedFolders] = useState<Record<string, boolean>>({});
   const [search, setSearch] = useState("");
@@ -85,10 +121,49 @@ export default function Home() {
   const suppressClickRef = useRef(false);
   const profilesRef = useRef(profiles);
   const seededLogsRef = useRef<Set<string>>(new Set());
+  const logClearUntilRef = useRef<Record<string, number>>({});
+  const startTimesRef = useRef<Record<string, number>>({});
+  const toastTimersRef = useRef<Map<number, number>>(new Map());
 
   useEffect(() => {
     profilesRef.current = profiles;
   }, [profiles]);
+
+  const dismissToast = useCallback((id: number) => {
+    const timer = toastTimersRef.current.get(id);
+    if (timer !== undefined) window.clearTimeout(timer);
+    toastTimersRef.current.delete(id);
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  const pushToast = useCallback(
+    (message: string, kind: ToastKind = "info") => {
+      const id = ++toastId;
+      setToasts((prev) => [...prev.slice(-4), { id, message, kind }]);
+      const timer = window.setTimeout(() => dismissToast(id), 4500);
+      toastTimersRef.current.set(id, timer);
+    },
+    [dismissToast]
+  );
+
+  const showError = useCallback(
+    (message: string) => {
+      setError(message);
+      pushToast(message, "error");
+    },
+    [pushToast]
+  );
+
+  useEffect(
+    () => () => {
+      for (const timer of toastTimersRef.current.values()) {
+        window.clearTimeout(timer);
+      }
+      toastTimersRef.current.clear();
+    },
+    []
+  );
+
   // Deteksi Tauri via useSyncExternalStore: server (static export) dan render
   // pertama di client sama-sama menghasilkan `false`, lalu berubah setelah
   // hydration tanpa setState sinkron di dalam effect → tidak terjadi
@@ -104,12 +179,14 @@ export default function Home() {
   const loading = isTauriEnv && !loaded;
 
   async function refreshAll() {
-    const [list, folderList] = await Promise.all([
+    const [list, folderList, config] = await Promise.all([
       api.listProfiles(),
       api.listFolders(),
+      api.configStatus(),
     ]);
     setProfiles(list);
     setFolders(folderList);
+    setConfigStatus(config);
   }
 
   useEffect(() => {
@@ -117,18 +194,40 @@ export default function Home() {
     let cancelled = false;
     (async () => {
       try {
-        const [list, folderList] = await Promise.all([
+        const [list, folderList, runtime, config] = await Promise.all([
           api.listProfiles(),
           api.listFolders(),
+          api.runtimeState(),
+          api.configStatus(),
         ]);
         if (!cancelled) {
           setProfiles(list);
           setFolders(folderList);
+          setConfigStatus(config);
+          // Proses yang masih hidup dari sesi sebelumnya (mis. app di-restart).
+          setStatuses((prev) => {
+            const next = { ...prev };
+            for (const info of runtime) next[info.profileId] = "running";
+            return next;
+          });
+          // Proses lama tidak punya event step status; tampilkan chip "spawned"
+          // untuk step-step profil yang masih hidup supaya UI tidak kosong.
+          setStepStatuses((prev) => {
+            const next = { ...prev };
+            for (const info of runtime) {
+              const profile = list.find((p) => p.id === info.profileId);
+              if (!profile || next[info.profileId]) continue;
+              next[info.profileId] = Object.fromEntries(
+                profile.steps.map((_, i) => [i, "spawned" as const])
+              );
+            }
+            return next;
+          });
           setLoaded(true);
         }
       } catch (err) {
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : String(err));
+          showError(err instanceof Error ? err.message : String(err));
           setLoaded(true);
         }
       }
@@ -136,27 +235,47 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [showError]);
 
   useEffect(() => {
     if (!isTauri()) return;
     let unlisten: (() => void) | null = null;
-    onProfileLog((payload: LogPayload) => {
+    let cancelled = false;
+    onProfileLogBatch((entries) => {
       setProfileLogs((prev) => {
-        const current = prev[payload.profileId] || [];
-        const next = [...current];
-        // Batasi jumlah baris per profile supaya tetap ringan.
-        if (next.length > 2000) next.splice(0, next.length - 2000);
-        next.push({
-          id: ++logId,
-          stepIndex: payload.stepIndex,
-          source: payload.source,
-          message: payload.message,
-        });
-        return { ...prev, [payload.profileId]: next };
+        const next = { ...prev };
+        const byProfile = new Map<string, LogEntry[]>();
+        for (const payload of entries) {
+          // Batch yang sudah antre sebelum `clear_profile_log` boleh masuk
+          // setelah file ditutup; jangan biarkan mengisi ulang log yang baru
+          // dikosongkan.
+          if (nowMs() < (logClearUntilRef.current[payload.profileId] ?? 0)) {
+            continue;
+          }
+          const list = byProfile.get(payload.profileId) ?? [];
+          list.push({
+            id: ++logId,
+            stepIndex: payload.stepIndex,
+            source: payload.source,
+            message: payload.message,
+          });
+          byProfile.set(payload.profileId, list);
+        }
+        for (const [profileId, incoming] of byProfile) {
+          const merged = [...(next[profileId] ?? []), ...incoming];
+          // Batasi jumlah baris per profile supaya memori tetap ringan.
+          next[profileId] =
+            merged.length > 2000 ? merged.slice(merged.length - 2000) : merged;
+        }
+        return next;
       });
-    }).then((un) => (unlisten = un));
+    }).then((un) => {
+      // Effect bisa dibersihkan sebelum `listen` selesai (Strict Mode/HMR).
+      if (cancelled) un();
+      else unlisten = un;
+    });
     return () => {
+      cancelled = true;
       unlisten?.();
     };
   }, []);
@@ -164,27 +283,62 @@ export default function Home() {
   useEffect(() => {
     if (!isTauri()) return;
     let unlisten: (() => void) | null = null;
+    let cancelled = false;
     onProfileStatus((payload: StatusPayload) => {
       setStatuses((prev) => ({
         ...prev,
         [payload.profileId]: payload.status,
       }));
+      // Event "starting" dipakai sebagai tonggak durasi. Ikut menangkap start
+      // dari Start All yang tidak lewat handler tombol per profile.
+      if (payload.status === "starting") {
+        startTimesRef.current[payload.profileId] = nowMs();
+        setRunStats((prev) => {
+          if (!prev[payload.profileId]) return prev;
+          const next = { ...prev };
+          delete next[payload.profileId];
+          return next;
+        });
+      }
+      if (payload.status === "failed" && payload.message) {
+        showError(payload.message);
+      }
       if (payload.status === "stopped" || payload.status === "failed") {
+        const startedAt = startTimesRef.current[payload.profileId];
+        if (startedAt !== undefined) {
+          delete startTimesRef.current[payload.profileId];
+          const durationMs = Math.max(0, nowMs() - startedAt);
+          const exitCode = payload.exitCode ?? null;
+          setRunStats((prev) => ({
+            ...prev,
+            [payload.profileId]: {
+              durationMs,
+              exitCode,
+              status: payload.status,
+            },
+          }));
+        }
         setStepStatuses((prev) => {
           const next = { ...prev };
           delete next[payload.profileId];
           return next;
         });
       }
-    }).then((un) => (unlisten = un));
+    }).then((un) => {
+      // Effect bisa dibersihkan sebelum `listen` selesai (Strict Mode/HMR).
+      if (cancelled) un();
+      else unlisten = un;
+    });
     return () => {
+      cancelled = true;
       unlisten?.();
     };
-  }, []);
+  }, [showError]);
 
   useEffect(() => {
     if (!isTauri()) return;
     let unlisten: (() => void) | null = null;
+    let cancelled = false;
     onProfileStepStatus((payload: StepStatusPayload) => {
       setStepStatuses((prev) => ({
         ...prev,
@@ -193,87 +347,267 @@ export default function Home() {
           [payload.stepIndex]: payload.state,
         },
       }));
-    }).then((un) => (unlisten = un));
+    }).then((un) => {
+      // Effect bisa dibersihkan sebelum `listen` selesai (Strict Mode/HMR).
+      if (cancelled) un();
+      else unlisten = un;
+    });
     return () => {
+      cancelled = true;
       unlisten?.();
     };
   }, []);
 
   async function handleSave(profile: Profile) {
     await api.saveProfile(profile);
+    setFormDirty(false);
     setEditing(null);
     await refreshAll();
+    pushToast(`Profile "${profile.name}" tersimpan.`, "success");
+  }
+
+  /// Buka form edit, tapi minta konfirmasi kalau ada perubahan yang belum disimpan.
+  function beginEdit(next: Profile | "new") {
+    if (next !== "new" && next.external) {
+      showError("Profile ini dikelola dari conf.jsonc, bukan lewat UI.");
+      return;
+    }
+    if (editing && formDirty) {
+      setConfirmState({
+        title: "Perubahan belum disimpan",
+        message: "Perubahan pada form belum disimpan. Tinggalkan form ini?",
+        confirmLabel: "Tinggalkan perubahan",
+        danger: true,
+        onConfirm: () => {
+          setConfirmState(null);
+          setFormDirty(false);
+          setEditing(next);
+        },
+      });
+      return;
+    }
+    setFormDirty(false);
+    setEditing(next);
   }
 
   async function handleDelete(id: string) {
-    if (!confirm("Hapus profile ini?")) return;
+    const target = profiles.find((p) => p.id === id);
+    if (target?.external) {
+      showError("Profile ini dikelola dari conf.jsonc, hapus lewat file tersebut.");
+      return;
+    }
+    setConfirmState({
+      title: "Hapus profile?",
+      message: "Hapus profile ini? Proses yang berjalan akan dihentikan.",
+      confirmLabel: "Hapus profile",
+      danger: true,
+      onConfirm: () => {
+        setConfirmState(null);
+        void deleteProfile(id);
+      },
+    });
+  }
+
+  async function deleteProfile(id: string) {
     try {
       await api.deleteProfile(id);
+      if (activeProfileId === id) setActiveProfileId(null);
+      if (editing !== "new" && editing?.id === id) {
+        setFormDirty(false);
+        setEditing(null);
+      }
+      seededLogsRef.current.delete(id);
+      setProfileLogs((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
       await refreshAll();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      showError(err instanceof Error ? err.message : String(err));
     }
   }
 
-  async function startProfileWithCheck(id: string) {
+  function setProfileBusy(id: string, value: boolean) {
+    setBusy((prev) => {
+      if (!value) {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      }
+      return { ...prev, [id]: true };
+    });
+  }
+
+  async function startProfileWithCheck(id: string, afterStop = false) {
     setError(null);
-    setStarting(true);
+    setProfileBusy(id, true);
     try {
-      const found = await api.checkPortConflicts(id);
-      if (found.length > 0) {
-        setConflicts(found);
+      // Quick restart: pastikan proses lama benar-benar berhenti dulu supaya
+      // preflight tidak melihat port milik profile yang sama masih terpakai.
+      if (afterStop) await api.stopProfile(id);
+      const result = await api.preflightProfile(id);
+      if (result.errors.length > 0) {
+        showError(result.errors.join(" "));
+        return;
+      }
+      if (result.conflicts.length > 0) {
+        setConflicts(result.conflicts);
         setPendingStartId(id);
-        setStarting(false);
         return;
       }
       await api.startProfile(id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      showError(err instanceof Error ? err.message : String(err));
     } finally {
-      setStarting(false);
+      setProfileBusy(id, false);
     }
   }
 
   async function handleKillAndContinue() {
     if (!pendingStartId) return;
-    setStarting(true);
+    const id = pendingStartId;
+    setProfileBusy(id, true);
+    setBulkBusy(true);
+    setError(null);
     try {
+      let killError: string | null = null;
       if (conflicts) {
+        // Kill hanya proses yang masih memegang port tersebut.
         for (const c of conflicts) {
           for (const pid of c.pids) {
-            await api.killProcess(pid);
+            try {
+              await api.killPortProcess(pid, c.port);
+            } catch (err) {
+              killError = err instanceof Error ? err.message : String(err);
+            }
           }
         }
       }
+      // Kalau ada kill yang gagal, jangan pakai `force`: itu akan menyalakan
+      // profile di atas port yang masih dipakai proses lain.
+      if (killError) {
+        showError(killError);
+        return;
+      }
+
+      // Proses baru bisa saja mengambil port di antara kill dan start.
+      const check = await api.preflightProfile(id);
+      if (check.errors.length > 0) {
+        showError(check.errors.join(" "));
+        return;
+      }
+      if (check.conflicts.length > 0) {
+        setConflicts(check.conflicts);
+        showError("Sebagian port masih bentrok. Periksa lagi lalu pilih tindakan.");
+        return;
+      }
       setConflicts(null);
-      await api.startProfile(pendingStartId);
       setPendingStartId(null);
+      await api.startProfile(id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      showError(err instanceof Error ? err.message : String(err));
     } finally {
-      setStarting(false);
+      setProfileBusy(id, false);
+      setBulkBusy(false);
     }
   }
 
   async function handleUseAltPort(overrides: Record<number, number>) {
     if (!pendingStartId) return;
-    setStarting(true);
+    const id = pendingStartId;
+    setProfileBusy(id, true);
+    setBulkBusy(true);
     try {
       setConflicts(null);
-      await api.startProfileWithPorts(pendingStartId, overrides);
       setPendingStartId(null);
+      await api.startProfile(id, { portOverrides: overrides });
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      showError(err instanceof Error ? err.message : String(err));
     } finally {
-      setStarting(false);
+      setProfileBusy(id, false);
+      setBulkBusy(false);
+    }
+  }
+
+  async function handleSkipExisting() {
+    if (!pendingStartId || !conflicts) return;
+    const id = pendingStartId;
+    const skipSteps = conflicts.map((c) => c.stepIndex);
+    setProfileBusy(id, true);
+    setBulkBusy(true);
+    try {
+      setConflicts(null);
+      setPendingStartId(null);
+      await api.startProfile(id, { skipSteps });
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setProfileBusy(id, false);
+      setBulkBusy(false);
     }
   }
 
   async function handleStop(id: string) {
+    setProfileBusy(id, true);
     try {
       await api.stopProfile(id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      showError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setProfileBusy(id, false);
+    }
+  }
+
+  async function handleStartAll() {
+    setError(null);
+    setBulkBusy(true);
+    try {
+      const result = await api.startAll();
+      const failedNames = result.failed.map((f) => f.name).join(", ");
+      const alreadyCount = result.alreadyRunning.length;
+
+      if (result.total === 0) {
+        pushToast(
+          "Belum ada profile. Tambah lewat UI atau isi conf.jsonc.",
+          "info"
+        );
+      } else if (result.failed.length > 0) {
+        showError(
+          `Start All: ${result.started} berhasil, ${result.failed.length} gagal${
+            failedNames ? `: ${failedNames}` : ""
+          }. Detail ada di log masing-masing.`
+        );
+      } else if (result.started > 0) {
+        pushToast(
+          `Berhasil start ${result.started} profile${
+            alreadyCount > 0 ? `, ${alreadyCount} sudah berjalan` : ""
+          }.`,
+          "success"
+        );
+      } else if (alreadyCount > 0) {
+        pushToast(
+          `Semua ${alreadyCount} profile sudah berjalan.`,
+          "info"
+        );
+      } else {
+        pushToast("Tidak ada perubahan dari Start All.", "info");
+      }
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
+  async function handleStopAll() {
+    setBulkBusy(true);
+    try {
+      await api.stopAll();
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBulkBusy(false);
     }
   }
 
@@ -294,24 +628,46 @@ export default function Home() {
         ...parsePersistedLogLine(line),
       }));
       if (entries.length > 0) {
-        setProfileLogs((prev) => ({
-          ...prev,
-          [id]: entries.slice(-2000),
-        }));
+        setProfileLogs((prev) => {
+          // Jangan timpa log live yang masuk saat `readProfileLog` masih
+          // berjalan. Gabungkan, lalu buang duplikat beruntun dari race
+          // antara tulisan disk dan event batch.
+          const existing = prev[id] ?? [];
+          const key = (e: LogEntry) =>
+            `${e.stepIndex}|${e.source}|${e.message}`;
+          const seen = new Set(existing.slice(-500).map(key));
+          const unique = entries.filter((e) => {
+            const k = key(e);
+            if (seen.has(k)) return false;
+            seen.add(k);
+            return true;
+          });
+          const merged = [...existing, ...unique];
+          return {
+            ...prev,
+            [id]: merged.length > 2000 ? merged.slice(merged.length - 2000) : merged,
+          };
+        });
       }
-    } catch {
-      // Gagal membaca log persist — biarkan log live tetap berfungsi.
+    } catch (err) {
+      // Log live tetap berfungsi, tapi beri tahu supaya tidak terlihat sukses.
+      showError(
+        `Gagal memuat log tersimpan untuk ${id}: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
     }
   }
 
   async function handleClearLog(id: string) {
     try {
       await api.clearProfileLog(id);
+      logClearUntilRef.current[id] = nowMs() + 750;
       seededLogsRef.current.delete(id);
       setProfileLogs((prev) => ({ ...prev, [id]: [] }));
       setLogTab("all");
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      showError(err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -327,43 +683,62 @@ export default function Home() {
       setCreatingFolder(false);
       await refreshAll();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      showError(err instanceof Error ? err.message : String(err));
     }
   }
 
   async function handleRenameFolderSubmit(old: string) {
     const name = renameValue.trim();
     if (!name || name === old) {
-      setRenamingFolder(null);
+      setRenamingFolder(undefined);
       return;
     }
     try {
       await api.renameFolder(old, name);
-      setRenamingFolder(null);
+      setRenamingFolder(undefined);
       await refreshAll();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      showError(err instanceof Error ? err.message : String(err));
     }
   }
 
   async function handleDeleteFolder(name: string) {
-    if (
-      !confirm(
-        `Hapus folder "${name}"? Profil di dalamnya akan dipindah ke "Tanpa Folder".`
-      )
-    )
-      return;
+    setConfirmState({
+      title: "Hapus folder?",
+      message: `Hapus folder "${name}"? Profil di dalamnya akan dipindah ke "Tanpa Folder".`,
+      confirmLabel: "Hapus folder",
+      danger: true,
+      onConfirm: () => {
+        setConfirmState(null);
+        void deleteFolder(name);
+      },
+    });
+  }
+
+  async function deleteFolder(name: string) {
     try {
       await api.deleteFolder(name);
       await refreshAll();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      showError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handleOpenConfig() {
+    try {
+      await api.openConfigFile();
+      setConfigStatus(await api.configStatus());
+      pushToast("Membuka conf.jsonc di editor/default aplikasi.", "success");
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
     }
   }
 
   // ---- Drag & drop (pointer-based) ----
 
   function onProfilePointerDown(e: ReactPointerEvent, id: string) {
+    // Flag drag sebelumnya bisa tertinggal kalau pointerup jatuh di luar card.
+    suppressClickRef.current = false;
     if (e.button !== 0) return;
     // Jangan mulai drag dari tombol (Start/Stop/Edit/Hapus).
     if ((e.target as HTMLElement).closest("button")) return;
@@ -406,6 +781,10 @@ export default function Home() {
     const list = profilesRef.current;
     const dragged = list.find((p) => p.id === draggedId);
     if (!dragged) return;
+    if (dragged.external) {
+      showError("Profile dari conf.jsonc tidak bisa dipindah lewat UI.");
+      return;
+    }
 
     try {
       if (target.kind === "folder") {
@@ -422,7 +801,7 @@ export default function Home() {
       }
       await refreshAll();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      showError(err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -512,37 +891,7 @@ export default function Home() {
 
   // ---- Tampilan grup ----
 
-  const groupMap = new Map<string | null, Profile[]>();
-  const folderSet = new Set(folders);
-  for (const p of profiles) {
-    const key = p.folder ?? null;
-    if (key !== null) folderSet.add(key);
-    if (!groupMap.has(key)) groupMap.set(key, []);
-    groupMap.get(key)!.push(p);
-  }
-  const folderNames = [...folderSet].sort((a, b) => a.localeCompare(b));
-  const groups: { name: string | null; profiles: Profile[] }[] = folderNames.map(
-    (name) => ({
-      name,
-      profiles: (groupMap.get(name) ?? [])
-        .slice()
-        .sort(
-          (a, b) =>
-            (a.order ?? 0) - (b.order ?? 0) || a.name.localeCompare(b.name)
-        ),
-    })
-  );
-  if (groupMap.has(null)) {
-    groups.push({
-      name: null,
-      profiles: (groupMap.get(null) ?? [])
-        .slice()
-        .sort(
-          (a, b) =>
-            (a.order ?? 0) - (b.order ?? 0) || a.name.localeCompare(b.name)
-        ),
-    });
-  }
+  const groups = groupProfiles(profiles, folders);
 
   // ---- Pencarian ----
 
@@ -567,17 +916,53 @@ export default function Home() {
         )
     : [];
 
+  /// Alternatif keyboard untuk drag & drop: Alt+Arrow naik/turun di dalam grup.
+  function handleCardKeyDown(e: ReactKeyboardEvent, p: Profile) {
+    if (e.target !== e.currentTarget) return;
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      selectActive(p.id);
+      return;
+    }
+    if (!e.altKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown")) return;
+    if (p.external) {
+      e.preventDefault();
+      showError("Profile dari conf.jsonc tidak bisa diurutkan lewat UI.");
+      return;
+    }
+    e.preventDefault();
+    const group = groups.find((g) => g.name === (p.folder ?? null))?.profiles ?? [];
+    const idx = group.findIndex((item) => item.id === p.id);
+    const nextIdx = idx + (e.key === "ArrowDown" ? 1 : -1);
+    if (idx < 0 || nextIdx < 0 || nextIdx >= group.length) return;
+    void insertAfter(p.id, group[nextIdx].id, p.folder ?? null, e.key === "ArrowDown").catch(
+      (err) => showError(err instanceof Error ? err.message : String(err))
+    );
+  }
+
   function renderProfileCard(p: Profile) {
     const status = statuses[p.id] ?? "stopped";
+    const isBusy = !!busy[p.id];
+    const stats = runStats[p.id];
     const isProfileTarget =
       dropTarget?.kind === "profile" && dropTarget.id === p.id;
     return (
       <div
         key={p.id}
         data-profile-id={p.id}
-        onPointerDown={(e) => onProfilePointerDown(e, p.id)}
+        role="button"
+        tabIndex={0}
+        aria-label={`Profile ${p.name}, status ${status}${
+          p.external ? ", dari conf.jsonc" : ""
+        }`}
+        aria-keyshortcuts={p.external ? undefined : "Alt+ArrowUp Alt+ArrowDown"}
+        title={p.external ? "Dikelola dari conf.jsonc" : "Alt+↑/↓ untuk mengurutkan"}
+        onPointerDown={(e) => {
+          if (!p.external) onProfilePointerDown(e, p.id);
+        }}
         onClick={() => handleCardClick(p.id)}
-        className={`relative cursor-pointer select-none rounded-md border p-3 transition-colors ${
+        onKeyDown={(e) => handleCardKeyDown(e, p)}
+        className={`relative cursor-pointer select-none rounded-md border p-3 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
           activeProfileId === p.id
             ? "border-blue-500 bg-blue-50"
             : "border-zinc-200 bg-white hover:border-zinc-300"
@@ -591,42 +976,71 @@ export default function Home() {
         )}
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0">
-            <p className="truncate text-sm font-semibold">{p.name}</p>
+            <p className="flex items-center gap-1.5 truncate text-sm font-semibold">
+              <span className="truncate">{p.name}</span>
+              {p.external && (
+                <span className="shrink-0 rounded border border-amber-300 bg-amber-50 px-1 text-[10px] font-medium text-amber-700">
+                  JSON
+                </span>
+              )}
+            </p>
             <p className="mt-0.5 truncate text-xs text-zinc-500">
               {p.steps.length} step
             </p>
+            {stats && (
+              <p className="mt-0.5 truncate text-[11px] text-zinc-400">
+                {formatDuration(stats.durationMs)} · exit{" "}
+                {stats.exitCode === null ? "—" : stats.exitCode} · {stats.status}
+              </p>
+            )}
           </div>
           <StatusDot status={status} />
         </div>
-        <div className="mt-3 flex items-center gap-2">
+        <div className="mt-3 flex flex-wrap items-center gap-2">
           {status === "running" || status === "starting" ? (
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                handleStop(p.id);
-              }}
-              className="rounded-md bg-zinc-800 px-3 py-1.5 text-xs font-medium text-white hover:bg-zinc-900"
-            >
-              Stop
-            </button>
+            <>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleStop(p.id);
+                }}
+                disabled={isBusy}
+                className="rounded-md bg-zinc-800 px-3 py-1.5 text-xs font-medium text-white hover:bg-zinc-900 disabled:opacity-50"
+              >
+                {isBusy ? "Menghentikan…" : "Stop"}
+              </button>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void startProfileWithCheck(p.id, true);
+                }}
+                disabled={isBusy || bulkBusy}
+                title="Stop lalu start ulang profile ini"
+                className="rounded-md border border-blue-300 px-3 py-1.5 text-xs font-medium text-blue-700 hover:bg-blue-50 disabled:opacity-50"
+              >
+                Restart
+              </button>
+            </>
           ) : (
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                startProfileWithCheck(p.id);
+                void startProfileWithCheck(p.id);
               }}
-              disabled={starting}
+              disabled={isBusy || bulkBusy}
               className="rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
             >
-              Start
+              {isBusy ? "Memeriksa…" : "Start"}
             </button>
           )}
           <button
             onClick={(e) => {
               e.stopPropagation();
-              setEditing(p);
+              beginEdit(p);
             }}
-            className="rounded-md border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
+            disabled={isBusy || p.external}
+            title={p.external ? "Edit lewat conf.jsonc" : undefined}
+            className="rounded-md border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50"
           >
             Edit
           </button>
@@ -635,7 +1049,9 @@ export default function Home() {
               e.stopPropagation();
               handleDelete(p.id);
             }}
-            className="rounded-md border border-red-200 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50"
+            disabled={isBusy || p.external}
+            title={p.external ? "Hapus lewat conf.jsonc" : undefined}
+            className="rounded-md border border-red-200 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-50"
           >
             Hapus
           </button>
@@ -655,7 +1071,23 @@ export default function Home() {
         </div>
         <div className="flex gap-2">
           <button
-            onClick={() => setEditing("new")}
+            onClick={handleStartAll}
+            disabled={bulkBusy}
+            className="rounded-md border border-emerald-300 px-3 py-2 text-sm font-medium text-emerald-700 hover:bg-emerald-50 disabled:opacity-50"
+            title="Start semua profile yang belum jalan"
+          >
+            Start All
+          </button>
+          <button
+            onClick={handleStopAll}
+            disabled={bulkBusy}
+            className="rounded-md border border-zinc-300 px-3 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50"
+            title="Stop semua proses"
+          >
+            Stop All
+          </button>
+          <button
+            onClick={() => beginEdit("new")}
             className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
           >
             + Tambah Profile
@@ -666,7 +1098,7 @@ export default function Home() {
       {!isTauriEnv && (
         <div className="mx-6 mt-4 rounded-md bg-amber-50 px-4 py-3 text-sm text-amber-800">
           <strong>Mode pratinjau web.</strong> Jalankan lewat{" "}
-          <code>cargo tauri dev</code> untuk fungsionalitas penuh (start/stop
+          <code>npm run tauri dev</code> untuk fungsionalitas penuh (start/stop
           proses, log, deteksi port, dan folder).
         </div>
       )}
@@ -683,8 +1115,40 @@ export default function Home() {
         </div>
       )}
 
+      {configStatus && (
+        <div className="mx-6 mt-3 flex flex-wrap items-center justify-between gap-2 rounded-md border border-zinc-200 bg-white px-4 py-2 text-xs text-zinc-600">
+          <div className="min-w-0">
+            <span className="font-semibold text-zinc-700">conf.jsonc</span>
+            <span className="ml-2 break-all" title={configStatus.path}>
+              {configStatus.path}
+            </span>
+            {configStatus.error ? (
+              <span className="ml-2 font-medium text-red-600">
+                Error: {configStatus.error}
+              </span>
+            ) : !configStatus.exists ? (
+              <span className="ml-2 text-amber-600">
+                Belum ada — tombol di kanan membuat file kosong.
+              </span>
+            ) : (
+              <span className="ml-2 text-emerald-600">Aktif</span>
+            )}
+          </div>
+          <button
+            onClick={() => void handleOpenConfig()}
+            className="shrink-0 rounded-md border border-zinc-300 px-2 py-1 font-medium text-zinc-700 hover:bg-zinc-50"
+          >
+            Buka conf.jsonc
+          </button>
+        </div>
+      )}
+
       {loading ? (
-        <div className="flex flex-1 items-center justify-center text-sm text-zinc-500">
+        <div
+          className="flex flex-1 items-center justify-center text-sm text-zinc-500"
+          role="status"
+          aria-live="polite"
+        >
           Memuat profile…
         </div>
       ) : (
@@ -751,7 +1215,7 @@ export default function Home() {
                   {searchResults.map(renderProfileCard)}
                 </div>
               )
-            ) : profiles.length === 0 && !editing && !creatingFolder ? (
+            ) : profiles.length === 0 && folders.length === 0 && !editing && !creatingFolder ? (
               <p className="mt-8 text-center text-sm text-zinc-500">
                 Belum ada profile. Klik &ldquo;+ Tambah Profile&rdquo; untuk
                 memulai.
@@ -771,7 +1235,7 @@ export default function Home() {
                         dropTarget?.kind === "folder" &&
                         dropTarget.folder === g.name
                       }
-                      renaming={renamingFolder === g.name}
+                      renaming={g.name !== null && renamingFolder === g.name}
                       renameValue={renameValue}
                       onToggle={() =>
                         setCollapsedFolders((prev) => ({
@@ -787,7 +1251,7 @@ export default function Home() {
                       onRenameSubmit={() => {
                         if (g.name !== null) handleRenameFolderSubmit(g.name);
                       }}
-                      onRenameCancel={() => setRenamingFolder(null)}
+                      onRenameCancel={() => setRenamingFolder(undefined)}
                       onDelete={() => {
                         if (g.name !== null) handleDeleteFolder(g.name);
                       }}
@@ -809,9 +1273,14 @@ export default function Home() {
           >
             {editing ? (
               <ProfileForm
+                key={editing === "new" ? "new" : editing.id}
                 initial={editing === "new" ? null : editing}
                 onSave={handleSave}
-                onCancel={() => setEditing(null)}
+                onDirtyChange={setFormDirty}
+                onCancel={() => {
+                  setFormDirty(false);
+                  setEditing(null);
+                }}
               />
             ) : activeProfileId ? (
               <>
@@ -858,6 +1327,8 @@ export default function Home() {
                             ? "bg-blue-100 text-blue-700 border-blue-300"
                             : state === "timeout"
                             ? "bg-amber-100 text-amber-700 border-amber-300"
+                            : state === "skipped"
+                            ? "bg-orange-100 text-orange-700 border-orange-300"
                             : "bg-zinc-100 text-zinc-500 border-zinc-200";
                         const kindLabel =
                           step.type === "exe"
@@ -903,9 +1374,10 @@ export default function Home() {
       {conflicts && pendingStartId && (
         <ConflictModal
           conflicts={conflicts}
-          busy={starting}
+          busy={bulkBusy}
           onKillAndContinue={handleKillAndContinue}
           onUseAltPort={handleUseAltPort}
+          onSkipExisting={handleSkipExisting}
           onCancel={() => {
             setConflicts(null);
             setPendingStartId(null);
@@ -920,6 +1392,18 @@ export default function Home() {
         >
           {profiles.find((p) => p.id === draggingId)?.name ?? "Profile"}
         </div>
+      )}
+
+      <ToastHost toasts={toasts} onDismiss={dismissToast} />
+      {confirmState && (
+        <ConfirmDialog
+          title={confirmState.title}
+          message={confirmState.message}
+          confirmLabel={confirmState.confirmLabel}
+          danger={confirmState.danger}
+          onConfirm={confirmState.onConfirm}
+          onCancel={() => setConfirmState(null)}
+        />
       )}
     </main>
   );

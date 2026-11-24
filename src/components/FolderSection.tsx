@@ -49,6 +49,8 @@ export default function FolderSection({
       <header className="flex items-center gap-1 px-2 py-1.5">
         <button
           onClick={onToggle}
+          aria-expanded={!collapsed}
+          aria-label={`${collapsed ? "Buka" : "Tutup"} folder ${isUngrouped ? "Tanpa Folder" : name}`}
           className="flex flex-1 items-center gap-1.5 text-left text-xs font-semibold text-zinc-700 hover:text-zinc-900"
         >
           <span className="text-zinc-400">{collapsed ? "▶" : "▼"}</span>
@@ -63,6 +65,7 @@ export default function FolderSection({
             <button
               onClick={onRenameStart}
               title="Rename folder"
+              aria-label={`Rename folder ${name}`}
               className="rounded px-1.5 py-0.5 text-[11px] text-zinc-500 hover:bg-zinc-200 hover:text-zinc-800"
             >
               ✎
@@ -70,6 +73,7 @@ export default function FolderSection({
             <button
               onClick={onDelete}
               title="Hapus folder"
+              aria-label={`Hapus folder ${name}`}
               className="rounded px-1.5 py-0.5 text-[11px] text-red-400 hover:bg-red-50 hover:text-red-600"
             >
               ✕

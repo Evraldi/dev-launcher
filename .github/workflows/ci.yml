@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Quality checks and Windows build
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install npm dependencies
+        run: npm ci
+        shell: pwsh
+
+      - name: ESLint
+        run: npm run lint
+        shell: pwsh
+
+      - name: TypeScript typecheck
+        run: npm run typecheck
+        shell: pwsh
+
+      - name: Unit tests (Vitest)
+        run: npm run test:unit
+        shell: pwsh
+
+      - name: Build frontend
+        run: npm run build
+        shell: pwsh
+
+      - name: Rust format, test and lint
+        working-directory: src-tauri
+        shell: pwsh
+        run: |
+          cargo fmt --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Tauri build (no bundle)
+        run: npm run tauri build -- --no-bundle
+        shell: pwsh
+
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev-launcher-windows-x86_64-${{ github.sha }}
+          path: src-tauri/target/release/dev-launcher.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  smoke:
+    name: Playwright smoke test
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+        shell: pwsh
+
+      - name: Install Playwright browser
+        run: npx playwright install chromium
+        shell: pwsh
+
+      - name: End-to-end smoke test
+        run: npm run test:e2e
+        shell: pwsh

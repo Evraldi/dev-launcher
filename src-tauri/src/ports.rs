@@ -1,12 +1,13 @@
-// Deteksi port aktif + kill process — logic di-reuse dari project port-monitor.
+// Deteksi port aktif — netstat parsing + metadata proses.
 use serde::Serialize;
 use std::collections::HashMap;
-use sysinfo::{Pid, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{ProcessesToUpdate, System, UpdateKind};
 
 #[cfg(windows)]
 use crate::util::CREATE_NO_WINDOW;
 
 #[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct PortInfo {
     pub port: u16,
     pub protocol: String,
@@ -17,8 +18,9 @@ pub struct PortInfo {
     pub cwd: String,
 }
 
-#[tauri::command]
-pub fn get_active_ports() -> Result<Vec<PortInfo>, String> {
+/// Versi blocking untuk dipakai internal (preflight, kill verifikasi).
+/// Command Tauri memakai wrapper async di bawah supaya UI thread tidak freeze.
+pub fn get_active_ports_blocking() -> Result<Vec<PortInfo>, String> {
     #[cfg(windows)]
     let mut cmd = {
         use std::os::windows::process::CommandExt;
@@ -124,11 +126,17 @@ pub fn get_active_ports() -> Result<Vec<PortInfo>, String> {
     Ok(ports)
 }
 
+#[tauri::command]
+pub async fn get_active_ports() -> Result<Vec<PortInfo>, String> {
+    tauri::async_runtime::spawn_blocking(get_active_ports_blocking)
+        .await
+        .map_err(|e| format!("Gagal membaca port: {e}"))?
+}
+
 /// Cari port bebas mulai dari `start` (naik ke atas, wrap di 65535).
 /// Port 0 dan ephemeral range di-skip supaya tidak dapet port sistem.
-#[tauri::command]
-pub fn find_free_port(start: u16) -> Result<u16, String> {
-    let used: std::collections::HashSet<u16> = get_active_ports()?
+pub fn find_free_port_blocking(start: u16) -> Result<u16, String> {
+    let used: std::collections::HashSet<u16> = get_active_ports_blocking()?
         .iter()
         .map(|p| p.port)
         .collect();
@@ -139,7 +147,12 @@ pub fn find_free_port(start: u16) -> Result<u16, String> {
             continue;
         }
         let candidate = candidate as u16;
-        if !used.contains(&candidate) {
+        if used.contains(&candidate) {
+            continue;
+        }
+        // Verifikasi dengan bind: netstat bisa saja belum menampilkan port
+        // yang baru dipakai proses lain.
+        if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
             return Ok(candidate);
         }
     }
@@ -147,17 +160,8 @@ pub fn find_free_port(start: u16) -> Result<u16, String> {
 }
 
 #[tauri::command]
-pub fn kill_process(pid: u32) -> Result<(), String> {
-    let mut sys = System::new();
-    sys.refresh_processes(ProcessesToUpdate::All, true);
-    match sys.process(Pid::from_u32(pid)) {
-        Some(process) => {
-            if process.kill() {
-                Ok(())
-            } else {
-                Err(format!("Gagal mematikan proses {pid}"))
-            }
-        }
-        None => Err(format!("Proses {pid} tidak ditemukan")),
-    }
+pub async fn find_free_port(start: u16) -> Result<u16, String> {
+    tauri::async_runtime::spawn_blocking(move || find_free_port_blocking(start))
+        .await
+        .map_err(|e| format!("Gagal mencari port: {e}"))?
 }

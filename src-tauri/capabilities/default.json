@@ -1,11 +1,16 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "enables the default permissions",
+  "description": "Izin minimal untuk window 'main' di Windows: hanya listen/unlisten event status dan log dari backend. Command aplikasi lokal dipanggil lewat invoke dan tidak memerlukan permission plugin lain.",
   "windows": [
     "main"
   ],
+  "platforms": [
+    "windows"
+  ],
+  "local": true,
   "permissions": [
-    "core:default"
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
   ]
 }

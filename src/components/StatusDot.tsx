@@ -16,8 +16,13 @@ const labels: Record<ProfileStatus, string> = {
 
 export default function StatusDot({ status }: { status: ProfileStatus }) {
   return (
-    <span className="inline-flex items-center gap-2">
+    <span
+      className="inline-flex items-center gap-2"
+      role="status"
+      aria-label={`Status: ${labels[status]}`}
+    >
       <span
+        aria-hidden="true"
         className={`inline-block h-2.5 w-2.5 rounded-full ${colors[status]}`}
       />
       <span className="text-xs text-zinc-500">{labels[status]}</span>

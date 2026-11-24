@@ -10,6 +10,12 @@ pub fn timestamp_now() -> String {
     Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+/// Timestamp ringkas untuk nama file: `YYYYMMDD-HHMMSS`.
+pub fn timestamp_compact() -> String {
+    use chrono::Local;
+    Local::now().format("%Y%m%d-%H%M%S%.3f").to_string()
+}
+
 /// Buang escape sequence ANSI (warna/kursor) dari output child process.
 /// Tanpa ini, log panel menampilkan kode mentah seperti `[32m[1mVITE[22m`.
 pub fn strip_ansi(input: &str) -> String {
@@ -55,9 +61,38 @@ pub fn strip_ansi(input: &str) -> String {
     out
 }
 
+/// URL yang aman untuk dibuka lewat `open_url`: hanya http/https, tanpa
+/// karakter kontrol. Ini mencegah step `open_url` dipakai menjalankan file
+/// atau exe lokal lewat ShellExecute.
+pub fn is_safe_http_url(url: &str) -> bool {
+    let url = url.trim();
+    if url.is_empty() || url.chars().any(|c| c.is_control()) {
+        return false;
+    }
+    let lower = url.to_ascii_lowercase();
+    (lower.starts_with("http://") || lower.starts_with("https://")) && url.len() > 8
+}
+
 #[cfg(test)]
 mod tests {
-    use super::strip_ansi;
+    use super::{is_safe_http_url, strip_ansi};
+
+    #[test]
+    fn accepts_http_urls() {
+        assert!(is_safe_http_url("http://localhost:3000"));
+        assert!(is_safe_http_url("  https://example.com/a?b=1  "));
+        assert!(is_safe_http_url("HTTP://LOCALHOST"));
+    }
+
+    #[test]
+    fn rejects_non_http_and_control_chars() {
+        assert!(!is_safe_http_url("C:\\Windows\\System32\\calc.exe"));
+        assert!(!is_safe_http_url("file:///C:/Windows/System32/calc.exe"));
+        assert!(!is_safe_http_url("javascript:alert(1)"));
+        assert!(!is_safe_http_url("http://x"));
+        assert!(!is_safe_http_url("http://a\nb"));
+        assert!(!is_safe_http_url(""));
+    }
 
     #[test]
     fn strips_sgr_colors() {
